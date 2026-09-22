@@ -7,14 +7,18 @@
 #
 #   echo_web      SELECT on the schema. EchoWeb only reads (readiness and
 #                 media ownership checks).
-#   echo_service  SELECT on the schema, plus EXECUTE on the stored procedures,
-#                 which are EchoService's whole write interface:
-#                   ECHO_DB_ACCESS=read-write  every procedure (the default)
-#                   ECHO_DB_ACCESS=read-only   only the *_GET procedures, so
-#                                              nothing can be sent or changed
+#   echo_service  SELECT on the schema, plus what it needs to write:
+#                   ECHO_DB_ACCESS=read-write  EXECUTE on every procedure, and
+#                                              UPDATE of sms_tbl_Message.bIsRead
+#                                              (the default)
+#                   ECHO_DB_ACCESS=read-only   EXECUTE on the *_GET procedures
+#                                              only, so nothing can be sent or
+#                                              changed
 #
-# The procedures run as their definer, so EXECUTE is all a writer needs;
-# neither app gets INSERT, UPDATE or DELETE on a table.
+# The procedures run as their definer, so EXECUTE covers almost every write.
+# The one exception is markConversationRead in EchoService, which updates
+# sms_tbl_Message.bIsRead directly, so read-write grants UPDATE on that one
+# column and nothing else. No other table-level write is granted.
 #
 # Run by an environment's operator with MySQL admin credentials, e.g. from a
 # throwaway client on a network that reaches the database:
@@ -71,6 +75,8 @@ account() { # USER PASSWORD — create or rotate, then start from no privileges
 
 if [ "$ACCESS" = read-write ]; then
   service_execute="GRANT EXECUTE ON \`$DB_GRANT\`.* TO '$SERVICE_USER'@'%';"
+  # Table-level grants take no wildcards, so the plain name is exact here.
+  service_execute+=$'\n'"GRANT UPDATE (bIsRead) ON \`$DB\`.\`sms_tbl_Message\` TO '$SERVICE_USER'@'%';"
 else
   service_execute=""
   while IFS= read -r routine; do
@@ -92,7 +98,7 @@ SQL
 
 echo "[db-users] $WEB_USER: SELECT on $DB"
 if [ "$ACCESS" = read-write ]; then
-  echo "[db-users] $SERVICE_USER: SELECT and EXECUTE (all procedures) on $DB"
+  echo "[db-users] $SERVICE_USER: SELECT, EXECUTE (all procedures) and UPDATE of sms_tbl_Message.bIsRead on $DB"
 else
   echo "[db-users] $SERVICE_USER: SELECT and EXECUTE on $(grep -c '^GRANT' <<<"$service_execute") *_GET procedure(s) on $DB (read-only)"
 fi

@@ -83,11 +83,12 @@ line by `scripts/db-users.sh`:
 | Account | Grants |
 |---|---|
 | `echo_web` | `SELECT` on `echo_db`. EchoWeb only reads. |
-| `echo_service` | `SELECT` on `echo_db`, plus `EXECUTE` on its stored procedures, which are EchoService's whole write interface. No table-level writes. |
+| `echo_service` | `SELECT` on `echo_db`, plus `EXECUTE` on its stored procedures (its write interface), plus `UPDATE` of `sms_tbl_Message.bIsRead`, the one write EchoService makes directly (marking a conversation read). No other table-level writes. |
 
 `ECHO_DB_ACCESS` picks how much EchoService may do in an environment:
 
-- `read-write` (default): `EXECUTE` on every procedure.
+- `read-write` (default): `EXECUTE` on every procedure, and `UPDATE` of
+  `sms_tbl_Message.bIsRead`.
 - `read-only`: `EXECUTE` only on the `*_GET` procedures, looked up when the
   script runs. Nothing can be sent, saved or deleted.
 
