@@ -55,6 +55,10 @@ admin() {
 }
 
 DB=$(name "$DB"); WEB_USER=$(name "$WEB_USER"); SERVICE_USER=$(name "$SERVICE_USER")
+# In a database-level GRANT, _ and % are wildcards: escape them so the grant
+# names exactly this database (echo\_db). Routine-level grants take no
+# wildcards and use the plain name.
+DB_GRANT=${DB//_/\\_}
 case "$ACCESS" in read-write|read-only) ;; *) die "ECHO_DB_ACCESS must be read-write or read-only" ;; esac
 
 account() { # USER PASSWORD — create or rotate, then start from no privileges
@@ -66,7 +70,7 @@ account() { # USER PASSWORD — create or rotate, then start from no privileges
 }
 
 if [ "$ACCESS" = read-write ]; then
-  service_execute="GRANT EXECUTE ON \`$DB\`.* TO '$SERVICE_USER'@'%';"
+  service_execute="GRANT EXECUTE ON \`$DB_GRANT\`.* TO '$SERVICE_USER'@'%';"
 else
   service_execute=""
   while IFS= read -r routine; do
@@ -80,9 +84,9 @@ fi
 admin <<SQL
 CREATE DATABASE IF NOT EXISTS \`$DB\`;
 $(account "$WEB_USER" "$ECHO_WEB_DB_PASSWORD")
-GRANT SELECT ON \`$DB\`.* TO '$WEB_USER'@'%';
+GRANT SELECT ON \`$DB_GRANT\`.* TO '$WEB_USER'@'%';
 $(account "$SERVICE_USER" "$ECHO_SERVICE_DB_PASSWORD")
-GRANT SELECT ON \`$DB\`.* TO '$SERVICE_USER'@'%';
+GRANT SELECT ON \`$DB_GRANT\`.* TO '$SERVICE_USER'@'%';
 $service_execute
 SQL
 
