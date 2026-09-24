@@ -25,12 +25,17 @@ Prerequisites on every host: Linux, Docker with Compose v2, `git`, `curl`, `jq`,
 domain: `X.TLD` is whatever domain this platform is deployed under.
 
 ```sh
-git clone https://github.com/localsplash/AidaPlatformDB.git /opt/local/AidaPlatformDB
-cd /opt/local/AidaPlatformDB
-./install.sh --help
+curl -fsSL https://raw.githubusercontent.com/localsplash/AidaPlatformDB/main/install.sh \
+  | bash -s -- database          # or: apps, officepulse, all; --help for the flags
 ```
 
-Every repository is taken from its `main` branch; `--branch dev` takes `dev`.
+That clones this repository into `/opt/local/AidaPlatformDB` (`--dir` moves the
+root) and continues from the checkout, so every host — database, application,
+PBX — starts the same way and ends up with the same folder. From an existing
+checkout, `./install.sh <phase>` does the same.
+
+Every repository is taken from its `main` branch; `--branch dev` takes `dev`
+(and the one-liner's URL should then name `dev` too).
 Values not given as flags are asked for; `--yes` makes missing values an error
 instead. `--dry-run` prints what would happen. Re-running is safe: existing
 `.env` values, rows with a value and accounts are kept, and only what is missing
@@ -42,11 +47,12 @@ is created.
    `MYSQL_ROOT_PASSWORD` and `NC_AUTH_JWT_SECRET`, `NOCODB_BASE_URL` =
    `https://nocodb.X.TLD`) and starts MySQL and NocoDB.
 2. Stops and asks you to **claim NocoDB** in a browser: the first sign-up
-   becomes its super admin. Then create a base named `PlatformConfig` (a base
-   created through the API stays invisible to API tokens, so this one step is
-   by hand) and one API token per application (Account → Tokens):
-   `installer`, `identity`, `aida-admin`, `aida-agent`, `echo-web`,
-   `echo-service`, and `officepulse` if you run it.
+   becomes its super admin. Then create a base named `PlatformConfig`, and
+   inside it one API token per application: `installer`, `identity`,
+   `aida-admin`, `aida-agent`, `echo-web`, `echo-service`, and `officepulse`
+   if you run it. (NocoDB binds an API token to the base it is created in —
+   a token can create another base but cannot work inside it — so the base
+   comes first and the tokens are made in it.)
 3. With the installer token, creates the `cfg_tbl_Setting` table in that base
    (found by name; nothing is recreated) and seeds the global rows:
    `ENVIRONMENT_NAME`, `PARENT_DOMAIN`, `trustedCIDR`.
