@@ -1,67 +1,103 @@
-# EchoDatabase's one-shot jobs, for an environment's own Compose file:
+# AidaPlatformDB: the shared MySQL and NocoDB every application on a platform
+# uses. Deploy this file on the database host (install.sh database); the
+# applications may live on the same host or on others.
 #
-#   include:
-#     - EchoDatabase/compose.yaml
+#   MySQL  (platform-mysql-local)  echo_db (Echo), platform_db (Identity),
+#          aida_admin_db (AidaAdmin) and aidacalls_db (OfficePulse runtime).
+#          Published on 127.0.0.1:3306 unless MYSQL_PUBLISH says otherwise;
+#          other hosts reach it as lsdb.X.TLD or through a tunnel.
+#   NocoDB (platform-nocodb-local) the PlatformConfig base whose cfg_tbl_Setting
+#          table is the settings store every app reads; public as
+#          NOCODB_BASE_URL (https://nocodb.X.TLD) through the reverse proxy.
 #
-# Nothing here starts a database. Both jobs run against the environment's
-# MySQL and exit; make EchoService/EchoWeb wait on them with
-# `condition: service_completed_successfully` if they should gate a deploy.
+# Networks and data volumes are external: other stacks share the networks,
+# and `down -v` must never be able to delete the data. install.sh creates
+# them; by hand:
+#   docker network create --subnet 192.168.112.0/20 platform-local
+#   docker network create --internal --subnet 10.247.23.0/24 echo-local
+#   docker volume create platform-mysql-data
+#   docker volume create platform-nocodb-data
 #
-#   echo-migrate   applies init/*.sql in order and records each in the
-#                  echo_tbl_SchemaMigration ledger (scripts/migrate.sh)
-#   echo-db-users  creates/updates echo_web and echo_service with their grants
-#                  (scripts/db-users.sh), after the migrations
-#
-# Values come from the including environment (see .env.example):
-#   ECHO_DB_NETWORK           Docker network that reaches the MySQL server
-#   ECHO_DB_HOST              its hostname on that network
-#   MYSQL_ADMIN_PASSWORD      admin password (MYSQL_ADMIN_USER, default root)
-#   ECHO_WEB_DB_PASSWORD      the DB_PASSWORD given to EchoWeb
-#   ECHO_SERVICE_DB_PASSWORD  the DB_PASSWORD given to EchoService
-#   ECHO_DB_ACCESS            read-write (default) or read-only
-# Optional: ECHO_DB_NAME (echo_db), ECHO_WEB_DB_USER (echo_web),
-# ECHO_SERVICE_DB_USER (echo_service).
+# Images are pinned by digest so a recreate never upgrades either service by
+# accident. Databases, users and grants belong to the apps that use them (each
+# repo's scripts/db-users.sh; echo/ here); nothing in this file creates them.
+# Secrets and this host's names are in .env next to this file (mode 600).
 
-x-mysql-client: &mysql-client
-  image: mysql:8.4
-  restart: "no"
-  networks:
-    - echo-db
+name: aidaplatformdb
+
+x-timezone: &timezone
+  - /etc/localtime:/etc/localtime:ro
+  - /etc/timezone:/etc/timezone:ro
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
 
 services:
-  echo-migrate:
-    <<: *mysql-client
-    entrypoint: ["bash", "/scripts/migrate.sh"]
+  mysql:
+    image: mysql@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb # 8.4.11
+    container_name: platform-mysql-local
+    hostname: ${MYSQL_HOSTNAME:-platform-mysql}
     environment:
-      DB_HOST: ${ECHO_DB_HOST:?ECHO_DB_HOST}
-      DB_USER: ${MYSQL_ADMIN_USER:-root}
-      MYSQL_PWD: ${MYSQL_ADMIN_PASSWORD:?MYSQL_ADMIN_PASSWORD}
-      MYSQL_DATABASE: ${ECHO_DB_NAME:-echo_db}
-      MIGRATIONS_DIR: /init
+      TZ: ${TZ:-America/Los_Angeles}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set in .env}
     volumes:
-      - ./init:/init:ro
-      - ./scripts:/scripts:ro
+      - mysql-data:/var/lib/mysql
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    ports:
+      # Loopback by default. A platform whose applications run on other hosts
+      # sets MYSQL_PUBLISH to a reachable address (e.g. 0.0.0.0:3306) and
+      # firewalls it to trustedCIDR.
+      - ${MYSQL_PUBLISH:-127.0.0.1:3306}:3306
+    networks:
+      - platform-local
+      - echo-local
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 -u root --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    logging: *logging
+    restart: unless-stopped
 
-  echo-db-users:
-    <<: *mysql-client
-    entrypoint: ["bash", "/scripts/db-users.sh"]
-    depends_on:
-      echo-migrate:
-        condition: service_completed_successfully
+  nocodb:
+    image: nocodb/nocodb@sha256:2aacc3c704d4f74b27e2a39ac838ac9019c0b008bbbfff673b541a3a75ee1579
+    container_name: platform-nocodb-local
+    hostname: ${NOCODB_HOSTNAME:-platform-nocodb}
     environment:
-      DB_HOST: ${ECHO_DB_HOST:?ECHO_DB_HOST}
-      DB_NAME: ${ECHO_DB_NAME:-echo_db}
-      MYSQL_ADMIN_USER: ${MYSQL_ADMIN_USER:-root}
-      MYSQL_ADMIN_PASSWORD: ${MYSQL_ADMIN_PASSWORD:?MYSQL_ADMIN_PASSWORD}
-      ECHO_WEB_DB_USER: ${ECHO_WEB_DB_USER:-echo_web}
-      ECHO_WEB_DB_PASSWORD: ${ECHO_WEB_DB_PASSWORD:?ECHO_WEB_DB_PASSWORD}
-      ECHO_SERVICE_DB_USER: ${ECHO_SERVICE_DB_USER:-echo_service}
-      ECHO_SERVICE_DB_PASSWORD: ${ECHO_SERVICE_DB_PASSWORD:?ECHO_SERVICE_DB_PASSWORD}
-      ECHO_DB_ACCESS: ${ECHO_DB_ACCESS:-read-write}
+      TZ: ${TZ:-America/Los_Angeles}
+      # NocoDB builds absolute links (invites, shared views) from its public URL.
+      NC_PUBLIC_URL: ${NOCODB_BASE_URL:?the public URL of this NocoDB, https://nocodb.X.TLD}
+      NC_DISABLE_TELE: "true"
+      NC_AUTH_JWT_SECRET: ${NC_AUTH_JWT_SECRET:?set in .env}
     volumes:
-      - ./scripts:/scripts:ro
+      - nocodb-data:/usr/app/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    ports:
+      - 127.0.0.1:18087:8080
+    networks:
+      - platform-local
+      - echo-local
+      - npm_network # the reverse proxy routes nocodb.X.TLD here
+    logging: *logging
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+    name: platform-mysql-data
+    external: true
+  nocodb-data:
+    name: platform-nocodb-data
+    external: true
 
 networks:
-  echo-db:
-    name: ${ECHO_DB_NETWORK:?ECHO_DB_NETWORK}
+  platform-local:
+    external: true
+  echo-local:
+    external: true
+  npm_network:
     external: true

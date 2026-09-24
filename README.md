@@ -1,138 +1,108 @@
-# EchoDatabase
+# AidaPlatformDB
 
-Echo owns the active messaging/media/carrier schema in `init/*.sql`.
-Identity owns users, tenants, memberships, sessions and tenant-number access;
-PlatformConfig owns runtime settings.
+The platform's database layer and the installer that stands a platform up.
 
-This repository also ships everything an environment needs to bring its own
-MySQL up to date and let the apps in:
+| What | Where |
+| --- | --- |
+| The shared **MySQL** and **NocoDB** every application uses | [`compose.yaml`](compose.yaml), [`.env.example`](.env.example) — deployed on the database host |
+| The **echo_db** schema, its migration runner and the `echo_web` / `echo_service` accounts | [`echo/`](echo/) — one-shot jobs an Echo environment `include:`s |
+| The **installer**: prerequisites, clones, `.env` files, database accounts, PlatformConfig rows, first deploy | [`install.sh`](install.sh) |
 
-- `scripts/migrate.sh`: the ordered upgrade runner ([Upgrading a database](#upgrading-a-database))
-- `scripts/db-users.sh`: the `echo_web` and `echo_service` accounts and their grants ([Database users](#database-users))
-- `compose.yaml`: both as one-shot jobs an environment `include:`s ([Running in an environment](#running-in-an-environment))
+NocoDB holds the `PlatformConfig` base. Its `cfg_tbl_Setting` table is the only
+settings source for every application (`app` scope + `settingKey` +
+`settingValue`, blank = unset). Each application's `.env` states just how to
+reach that store: `NOCODB_BASE_URL` and its own `NOCODB_API_TOKEN`. Databases,
+accounts and grants belong to the application that owns them — Identity,
+AidaAdmin and OfficePulse each ship a `scripts/db-users.sh`, and Echo's live in
+[`echo/scripts`](echo/scripts). Nothing in this repo invents a value for
+another app.
 
-## Disposable Dev retirement
+## Installing a platform
 
-The current Dev decision intentionally deletes obsolete configuration and local
-authentication/provenance data. No backup, rollback copy or preservation window
-is required for this cleanup. Deploy the matching EchoWeb/EchoService revisions
-with environment-provided NocoDB credentials first, then apply
-`init/013_retire_legacy_configuration_and_auth.sql`.
+Prerequisites on every host: Linux, Docker with Compose v2, `git`, `curl`, `jq`,
+`openssl`, and a reverse proxy (Nginx Proxy Manager) on a Docker network named
+`npm_network` that terminates TLS for `*.X.TLD`. The installer refuses to guess a
+domain: `X.TLD` is whatever domain this platform is deployed under.
 
-The migration drops exactly these tables, with foreign-key enforcement kept on:
-
-- `echo_tbl_Settings`
-- `echo_tbl_PlatformOrgMap`, `echo_tbl_PlatformUserMap`
-- `auth_tbl_Identity`, `auth_tbl_Membership`
-- `auth_tbl_Session`, `auth_tbl_SsoNonce`
-- `auth_tbl_User`, `auth_tbl_Org`
-
-Child tables are dropped before their parents; `DROP TABLE IF EXISTS` allows
-safe repeat execution after an interrupted run. No `sms_*` table/routine or
-`echo_tbl_SchemaMigration` ledger is removed. Their data is still in active use.
-No Identity `platform_db` or OfficePulse/Asterisk vendor object is changed here.
-
-The old init files 005–009 and 012 are removed, together with the unused mapping
-importer, so a fresh database never recreates obsolete objects. The migration
-runner's ledger records filenames, not checksums; old ledger rows may remain as execution
-history, and existing databases receive the new numbered 013 migration. There
-is no technical dependency requiring the deleted seed files to stay in `init/`.
-
-Before applying the migration, inspect the target database's foreign keys and
-stored routines for unexpected references to the listed objects. Current source
-has no active consumer: EchoWeb's unused legacy helper/import scripts are removed,
-EchoService and EchoWeb read only PlatformConfig, and messaging schema foreign
-keys reference only messaging/carrier objects. Stop legacy images before cleanup.
-
-Track exact deployed versions, applied SQL, table absence, startup and tenant
-access checks in [issue #8](https://github.com/localsplash/EchoDatabase/issues/8).
-This supersedes the earlier preservation and rollback-window plan.
-
-## Validation
-
-EchoWeb's `src/platform.integration.test.ts`, with this checkout provided as
-`ECHO_DATABASE_SOURCE` and a disposable MySQL 8.4 `TEST_DB_URL`, initializes the
-complete current fresh schema and exercises a messaging routine. It then creates
-populated legacy tables with foreign keys, applies migration 013 twice, and
-checks table removal, active messaging/ledger retention, and central session
-access without local auth/mapping tables. It recreates only `echo_platform_test`.
-
-## Upgrading a database
-
-MySQL loads `init/` only into an empty data directory, so a file added later
-never reaches an existing database by itself. `scripts/migrate.sh` applies the
-files in order against the database as it is, and records each one in
-`echo_tbl_SchemaMigration` once it succeeds. Every later run skips recorded
-files, so it is safe on every deploy. The files are not idempotent; the ledger
-is the whole safety mechanism.
-
-A database that has the schema but no ledger (initialised before the runner
-existed) is baselined: every current file is recorded as applied without being
-run, and the runner says so loudly. An empty database gets every file applied
-in order. The runner moved here from EchoOrchestrator unchanged, so ledgers it
-wrote carry on as they are.
-
-It needs MySQL admin rights (`DB_HOST`, `DB_USER`, `MYSQL_PWD`,
-`MYSQL_DATABASE`, `MIGRATIONS_DIR`).
-
-## Database users
-
-EchoWeb and EchoService each connect as their own account, created and kept in
-line by `scripts/db-users.sh`:
-
-| Account | Grants |
-|---|---|
-| `echo_web` | `SELECT` on `echo_db`. EchoWeb only reads. |
-| `echo_service` | `SELECT` on `echo_db`, plus `EXECUTE` on its stored procedures (its write interface), plus `UPDATE` of `sms_tbl_Message.bIsRead`, the one write EchoService makes directly (marking a conversation read). No other table-level writes. |
-
-`ECHO_DB_ACCESS` picks how much EchoService may do in an environment:
-
-- `read-write` (default): `EXECUTE` on every procedure, and `UPDATE` of
-  `sms_tbl_Message.bIsRead`.
-- `read-only`: `EXECUTE` only on the `*_GET` procedures, looked up when the
-  script runs. Nothing can be sent, saved or deleted.
-
-The script is idempotent. It creates missing accounts, sets the passwords it is
-given (so re-running with a new value rotates it), revokes everything and grants
-exactly the above. Run it after the migrations, since the read-only grants name
-routines. Accounts are created for any host (`'%'`); which networks can reach
-MySQL is the environment's decision.
-
-The passwords are whatever the environment gives each app as `DB_PASSWORD`;
-keep them wherever the environment keeps that value (for example the host's
-`.env` next to its Compose file) and pass the same values here.
-
-The single full-rights `echo_app` account that `MYSQL_USER` used to create is
-retired. An environment still running on it should create these two accounts,
-move each app's `DB_USER`/`DB_PASSWORD` over, then drop `echo_app`.
-
-## Running in an environment
-
-An environment's own Compose file includes `compose.yaml`:
-
-```yaml
-include:
-  - EchoDatabase/compose.yaml
+```sh
+git clone https://github.com/localsplash/AidaPlatformDB.git /opt/local/AidaPlatformDB
+cd /opt/local/AidaPlatformDB
+./install.sh --help
 ```
 
-It adds two one-shot jobs that run against the environment's MySQL and exit:
-`echo-migrate`, then `echo-db-users`. Their values come from the environment
-(see `.env.example`): `ECHO_DB_NETWORK` and `ECHO_DB_HOST` to reach MySQL,
-`MYSQL_ADMIN_PASSWORD`, the two app passwords, and `ECHO_DB_ACCESS`. Make
-EchoService and EchoWeb wait on them with `condition:
-service_completed_successfully` if a deploy should stop when either fails. Or
-run them by hand:
+Every repository is taken from its `main` branch; `--branch dev` takes `dev`.
+Values not given as flags are asked for; `--yes` makes missing values an error
+instead. `--dry-run` prints what would happen. Re-running is safe: existing
+`.env` values, rows with a value and accounts are kept, and only what is missing
+is created.
 
-```bash
-docker compose -f EchoDatabase/compose.yaml --env-file /path/to/env up
-```
+### a) The database host — `./install.sh database`
 
-## Local development
+1. Creates the external networks and volumes, writes `.env` (generated
+   `MYSQL_ROOT_PASSWORD` and `NC_AUTH_JWT_SECRET`, `NOCODB_BASE_URL` =
+   `https://nocodb.X.TLD`) and starts MySQL and NocoDB.
+2. Stops and asks you to **claim NocoDB** in a browser: the first sign-up
+   becomes its super admin. Then create a base named `PlatformConfig` (a base
+   created through the API stays invisible to API tokens, so this one step is
+   by hand) and one API token per application (Account → Tokens):
+   `installer`, `identity`, `aida-admin`, `aida-agent`, `echo-web`,
+   `echo-service`, and `officepulse` if you run it.
+3. With the installer token, creates the `cfg_tbl_Setting` table in that base
+   (found by name; nothing is recreated) and seeds the global rows:
+   `ENVIRONMENT_NAME`, `PARENT_DOMAIN`, `trustedCIDR`.
 
-`docker compose -f compose.dev.yaml up -d` creates a throwaway MySQL and applies
-the current `init/` files to its empty volume. Running `compose.yaml` against it
-on the `echo-db-dev` network then baselines the ledger and creates the app
-accounts, exactly as in an environment (commands in `compose.dev.yaml`).
-Application DB coordinates stay deployment bootstrap; EchoMedia
-still needs only its port and media mount path. Asterisk/OfficePulse own extensions,
-queues, memberships and applied DID routes; POC PBX reads use its integration API.
+When it finishes it reminds you that NocoDB holds every secret the platform
+has: block it from the public internet at the reverse proxy, or allow only
+`trustedCIDR`.
+
+`--mysql-publish 0.0.0.0:3306` is for a platform whose applications run on
+other hosts; they reach MySQL as `lsdb.X.TLD`. Firewall that port to
+`trustedCIDR`.
+
+### b) The application host — `./install.sh apps`
+
+Recommended on its own host; the same host as the database also works (the
+apps then reach MySQL by container name).
+
+1. Ensures `npm_network`, `platform-local`, `echo-local` and the data volumes.
+2. Clones `identity`, `AidaAdmin`, `AidaAgent`, `EchoWeb`, `EchoService` and
+   `EchoMedia` under `--dir` (default `/opt/local`), laid out the way the
+   compose files expect:
+
+   ```
+   /opt/local/AidaPlatformDB      this repo (echo/ is included by the Echo environment)
+   /opt/local/identity
+   /opt/local/aida/AidaAdmin
+   /opt/local/aida/AidaAgent
+   /opt/local/echo                the Echo environment (from EchoWeb/deploy/environment)
+     ├── EchoWeb  EchoService  EchoMedia
+     └── compose.yaml  web.host.yaml  service.host.yaml  deploy.sh  .env
+   ```
+3. Writes each `.env` with `NOCODB_BASE_URL` and that application's token, and
+   Echo's with the generated MySQL passwords its jobs create.
+4. Creates the MySQL accounts (`identity`, `aida_admin_app`; Echo's are created
+   by its own jobs at deploy) and seeds the rows the applications need to
+   start: database coordinates, the shared `IDENTITY_CLIENT_SECRET`, session
+   and webhook secrets, the public URLs derived from `PARENT_DOMAIN`
+   (`https://identity.X.TLD`, `https://aida-admin.X.TLD`,
+   `https://officepulse-api.X.TLD`) and the voice model defaults.
+5. Builds and starts everything, then prints the reverse-proxy hosts to create
+   and what is still yours to fill in: Identity's OAuth provider credentials
+   (`/setup` in a browser claims the instance), the `aida/LIVEKIT_*` rows, and
+   carrier credentials.
+
+### c) The PBX host — `./install.sh officepulse`
+
+Requires Asterisk running on that host and Node 22. Clones
+`OfficePulseAidaIntegration`, writes its `/etc/aida-integration/env`
+(`NOCODB_BASE_URL`, `NOCODB_API_TOKEN`) and runs its own `scripts/install.sh`.
+Its settings are the `officepulse` rows (see that repository's README).
+
+## Day-to-day
+
+- Deploy the database layer with `docker compose up -d` in this folder; each
+  application with its own folder's `deploy.sh` or Compose file.
+- Upgrading `echo_db` is a normal Echo deploy: the `echo-migrate` job applies
+  new `echo/init/*.sql` files first ([echo/README.md](echo/README.md)).
+- Rotating a password: change the row (or Echo's `.env`) and re-run the
+  owning `db-users.sh`; they converge.
