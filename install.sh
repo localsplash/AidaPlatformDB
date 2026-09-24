@@ -7,6 +7,12 @@
 #   ./install.sh officepulse  OfficePulseAidaIntegration on the PBX host
 #   ./install.sh all          database, then apps, on one host
 #
+# Run it from a checkout, or straight from GitHub on a fresh host:
+#
+#   curl -fsSL https://raw.githubusercontent.com/localsplash/AidaPlatformDB/main/install.sh \
+#     | bash -s -- apps --branch main
+#
+# (it then clones this repository under --dir and continues from there).
 # Every value it needs is a flag or a prompt; nothing is guessed about the
 # domain. Re-running is safe: existing .env values, rows with a value and
 # accounts are kept. README.md describes each phase.
@@ -51,7 +57,7 @@ ECHO_NETWORK=echo-local
 ECHO_SUBNET=10.247.23.0/24
 
 usage() {
-  sed -n '3,12p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '3,18p' "$SELF" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 Options
@@ -82,15 +88,16 @@ have() { command -v "$1" >/dev/null 2>&1; }
 secret() { openssl rand -hex 32; }
 
 # ask VAR --flag "prompt" [default]: keeps a value already given, otherwise
-# prompts (or takes the default under --yes / without a terminal).
+# prompts on the terminal (or takes the default under --yes / without one).
+# Prompts read /dev/tty, so `curl | bash` — whose stdin is the script — works.
 ask() {
   local var=$1 flag=$2 prompt=$3 default=${4:-} value
   [ -n "${!var}" ] && return 0
-  if (( YES )) || [ ! -t 0 ]; then
+  if (( YES )) || ! { : < /dev/tty; } 2>/dev/null; then
     [ -n "$default" ] && { printf -v "$var" '%s' "$default"; return 0; }
     die "$prompt: give it with $flag"
   fi
-  read -r -p "$prompt${default:+ [$default]}: " value
+  read -r -p "$prompt${default:+ [$default]}: " value < /dev/tty
   printf -v "$var" '%s' "${value:-$default}"
   [ -n "${!var}" ] || die "$prompt is required"
 }
@@ -181,10 +188,11 @@ ensure_platformconfig() {
   bases=$(nc /api/v2/meta/bases) || die "NocoDB at ${NOCODB_API_URL:-$NOCODB_BASE_URL} did not answer or rejected the token"
   base_id=$(jq -r --arg t "$BASE_NAME" '[.list[] | select(.title==$t)] | if length==1 then .[0].id elif length==0 then "" else "dup" end' <<<"$bases")
   [ "$base_id" != dup ] && [ "$base_id" != null ] || die "more than one NocoDB base is named $BASE_NAME"
-  # A base created through the API is not visible to the API token afterwards
-  # (NocoDB grants base access to the token's user only when the base is
-  # created in the UI), so the base itself is the one thing created by hand.
-  [ -n "$base_id" ] || die "no NocoDB base named $BASE_NAME: create it in the NocoDB UI (Bases -> New base) and re-run"
+  # NocoDB API tokens are bound to the base they are created in
+  # (nc_api_tokens.base_id): a token can create another base but cannot work
+  # inside it. So the base exists first, the tokens are created in it, and
+  # this table is the first thing the installer's token makes.
+  [ -n "$base_id" ] || die "no NocoDB base named $BASE_NAME: create it in the NocoDB UI, create the tokens inside it, and re-run"
   note "base $BASE_NAME found"
   tables=$(nc "/api/v2/meta/bases/$base_id/tables")
   TABLE_ID=$(jq -r --arg t "$TABLE_NAME" '[.list[] | select(.title==$t)] | if length==1 then .[0].id elif length==0 then "" else "dup" end' <<<"$tables")
@@ -310,8 +318,9 @@ phase_database() {
   log "Claim NocoDB"
   note "Route $NOCODB_BASE_URL at the reverse proxy to platform-nocodb-local:8080 on $PROXY_NETWORK,"
   note "open it, and sign up: the first account becomes NocoDB's super admin. Then:"
-  note "  1. create a base named $BASE_NAME (Bases -> New base); the API cannot do this for you,"
-  note "  2. create one API token per application (Account -> Tokens): installer, identity,"
+  note "  1. create a base named $BASE_NAME (API tokens are bound to the base they are"
+  note "     created in, so it has to exist before the tokens do),"
+  note "  2. in that base, create one API token per application: installer, identity,"
   note "     aida-admin, aida-agent, echo-web, echo-service, and officepulse if you run it."
   if [ -z "$NOCODB_TOKEN" ] && { (( YES )) || [ ! -t 0 ]; }; then
     note "No --nocodb-token: skipping the PlatformConfig rows. Re-run with a token to seed them."
@@ -514,6 +523,7 @@ phase_officepulse() {
 # Test seam: `INSTALL_SOURCE_ONLY=1 source install.sh` loads the functions only.
 if [ "${INSTALL_SOURCE_ONLY:-}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
 
+ARGS=("$@")
 PHASE=""
 while [ $# -gt 0 ]; do
   case $1 in
@@ -544,6 +554,16 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$PHASE" ] || { usage; exit 2; }
 case $ENVIRONMENT_NAME in ""|dev|staging|prod) ;; *) die "--environment-name must be dev, staging or prod" ;; esac
+
+# Piped from GitHub rather than run from a checkout: get the checkout this
+# script is the front of (compose.yaml, echo/, and itself) and carry on there.
+if [ ! -f "$SELF_DIR/compose.yaml" ] || [ ! -d "$SELF_DIR/echo" ]; then
+  log "Not running from an AidaPlatformDB checkout: cloning $BRANCH into $DIR/AidaPlatformDB"
+  prereqs git
+  DRY=0 clone_or_update AidaPlatformDB "$DIR/AidaPlatformDB"
+  [ -x "$DIR/AidaPlatformDB/install.sh" ] || die "branch $BRANCH of AidaPlatformDB has no install.sh yet; use --branch dev (and the dev URL) until it is promoted"
+  exec "$DIR/AidaPlatformDB/install.sh" "${ARGS[@]}"
+fi
 (( DRY )) && log "Dry run: nothing below is applied"
 
 case $PHASE in
