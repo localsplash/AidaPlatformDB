@@ -1,0 +1,68 @@
+# echo_db's one-shot jobs, for an Echo environment's own Compose file (the
+# AidaPlatformDB checkout sits beside the environment folder):
+#
+#   include:
+#     - ../AidaPlatformDB/echo/compose.yaml
+#
+# Nothing here starts a database. Both jobs run against the environment's
+# MySQL and exit; make EchoService/EchoWeb wait on them with
+# `condition: service_completed_successfully` if they should gate a deploy.
+#
+#   echo-migrate   applies init/*.sql in order and records each in the
+#                  echo_tbl_SchemaMigration ledger (scripts/migrate.sh)
+#   echo-db-users  creates/updates echo_web and echo_service with their grants
+#                  (scripts/db-users.sh), after the migrations
+#
+# Values come from the including environment (see .env.example):
+#   ECHO_NETWORK              the environment's Echo network; it must reach MySQL
+#   ECHO_DB_HOST              MySQL's hostname as seen from that network
+#   MYSQL_ADMIN_PASSWORD      admin password (MYSQL_ADMIN_USER, default root)
+#   ECHO_WEB_DB_PASSWORD      the DB_PASSWORD given to EchoWeb
+#   ECHO_SERVICE_DB_PASSWORD  the DB_PASSWORD given to EchoService
+#   ECHO_DB_ACCESS            read-write (default) or read-only
+# Optional: ECHO_DB_NAME (echo_db), ECHO_WEB_DB_USER (echo_web),
+# ECHO_SERVICE_DB_USER (echo_service).
+
+x-mysql-client: &mysql-client
+  image: mysql:8.4
+  restart: "no"
+  networks:
+    - echo-db
+
+services:
+  echo-migrate:
+    <<: *mysql-client
+    entrypoint: ["bash", "/scripts/migrate.sh"]
+    environment:
+      DB_HOST: ${ECHO_DB_HOST:?ECHO_DB_HOST}
+      DB_USER: ${MYSQL_ADMIN_USER:-root}
+      MYSQL_PWD: ${MYSQL_ADMIN_PASSWORD:?MYSQL_ADMIN_PASSWORD}
+      MYSQL_DATABASE: ${ECHO_DB_NAME:-echo_db}
+      MIGRATIONS_DIR: /init
+    volumes:
+      - ./init:/init:ro
+      - ./scripts:/scripts:ro
+
+  echo-db-users:
+    <<: *mysql-client
+    entrypoint: ["bash", "/scripts/db-users.sh"]
+    depends_on:
+      echo-migrate:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: ${ECHO_DB_HOST:?ECHO_DB_HOST}
+      DB_NAME: ${ECHO_DB_NAME:-echo_db}
+      MYSQL_ADMIN_USER: ${MYSQL_ADMIN_USER:-root}
+      MYSQL_ADMIN_PASSWORD: ${MYSQL_ADMIN_PASSWORD:?MYSQL_ADMIN_PASSWORD}
+      ECHO_WEB_DB_USER: ${ECHO_WEB_DB_USER:-echo_web}
+      ECHO_WEB_DB_PASSWORD: ${ECHO_WEB_DB_PASSWORD:?ECHO_WEB_DB_PASSWORD}
+      ECHO_SERVICE_DB_USER: ${ECHO_SERVICE_DB_USER:-echo_service}
+      ECHO_SERVICE_DB_PASSWORD: ${ECHO_SERVICE_DB_PASSWORD:?ECHO_SERVICE_DB_PASSWORD}
+      ECHO_DB_ACCESS: ${ECHO_DB_ACCESS:-read-write}
+    volumes:
+      - ./scripts:/scripts:ro
+
+networks:
+  echo-db:
+    name: ${ECHO_NETWORK:?ECHO_NETWORK}
+    external: true

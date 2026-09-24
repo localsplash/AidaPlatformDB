@@ -7,7 +7,7 @@
 # then run the same one-shots a real environment runs (ledger baseline and
 # app users) on its network:
 #
-#   ECHO_DB_NETWORK=echo-db-dev ECHO_DB_HOST=echo-database \
+#   ECHO_NETWORK=echo-db-dev ECHO_DB_HOST=echo-database \
 #     MYSQL_ADMIN_PASSWORD=devroot ECHO_WEB_DB_PASSWORD=devweb \
 #     ECHO_SERVICE_DB_PASSWORD=devservice docker compose up
 name: echo-database-dev
