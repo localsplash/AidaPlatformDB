@@ -102,6 +102,42 @@ ask() {
   [ -n "${!var}" ] || die "$prompt is required"
 }
 
+# The apex domain. Defaults to this host's own domain (its FQDN minus the host
+# label), and anything that looks like a host name rather than an apex — the
+# FQDN itself, more than two labels, or a first label such as www or one of the
+# platform's own app names — is shown with the hostnames it would produce and
+# has to be confirmed or corrected. --yes accepts it with the warning.
+ask_parent_domain() {
+  local fqdn short default answer label
+  fqdn=$(hostname -f 2>/dev/null | tr 'A-Z' 'a-z' || true)
+  short=${fqdn%%.*}
+  default=$(hostname -d 2>/dev/null | tr 'A-Z' 'a-z' || true)
+  while :; do
+    ask PARENT_DOMAIN --parent-domain "Apex domain this platform lives under (X.TLD: the apps become identity.X.TLD, nocodb.X.TLD, ...)" "$default"
+    PARENT_DOMAIN=$(printf '%s' "$PARENT_DOMAIN" | tr 'A-Z' 'a-z' | sed -E 's#^https?://##; s#/.*$##; s/\.$//')
+    if ! [[ $PARENT_DOMAIN =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+      (( YES )) && die "--parent-domain '$PARENT_DOMAIN' is not a domain name"
+      note "'$PARENT_DOMAIN' is not a domain name (letters, digits, hyphens and dots, e.g. example.com)"
+      PARENT_DOMAIN=""; continue
+    fi
+    label=${PARENT_DOMAIN%%.*}
+    local suspicious=""
+    if [ -n "$fqdn" ] && [ "$PARENT_DOMAIN" = "$fqdn" ]; then suspicious="it is this host's own name"
+    elif [ "$label" = "$short" ]; then suspicious="it starts with this host's name"
+    elif [[ " www identity nocodb echo echo-service aida-admin officepulse-api lsdb " == *" $label "* ]]; then suspicious="it starts with '$label', one of the platform's own hostnames"
+    elif [ "$(tr -dc . <<<"$PARENT_DOMAIN" | wc -c)" -gt 1 ]; then suspicious="it has more than two labels"
+    fi
+    [ -z "$suspicious" ] && return 0
+    note "'$PARENT_DOMAIN' looks like a host name rather than an apex domain ($suspicious)."
+    note "With it, the platform's hostnames become identity.$PARENT_DOMAIN, nocodb.$PARENT_DOMAIN,"
+    note "echo.$PARENT_DOMAIN, aida-admin.$PARENT_DOMAIN ...${default:+ This host is under $default.}"
+    if (( YES )) || ! { : < /dev/tty; } 2>/dev/null; then note "Accepting it as given (--yes)."; return 0; fi
+    read -r -p "Use '$PARENT_DOMAIN' as the apex domain anyway? [y/N] " answer < /dev/tty
+    case ${answer,,} in y|yes) return 0 ;; esac
+    PARENT_DOMAIN=""
+  done
+}
+
 prereqs() {
   local missing=()
   for tool in "$@"; do have "$tool" || missing+=("$tool"); done
@@ -292,7 +328,7 @@ compose_up() { # DIR
 phase_database() {
   log "Database host: MySQL and NocoDB from $SELF_DIR"
   prereqs docker git jq openssl curl
-  ask PARENT_DOMAIN --parent-domain "Apex domain this platform lives under (X.TLD)"
+  ask_parent_domain
   ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" dev
   NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
 
@@ -347,7 +383,7 @@ phase_database() {
 phase_apps() {
   log "Application host: Identity, AidaAdmin, AidaAgent and the Echo environment under $DIR"
   prereqs docker git jq openssl curl
-  ask PARENT_DOMAIN --parent-domain "Apex domain this platform lives under (X.TLD)"
+  ask_parent_domain
   ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" dev
   NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
   ask TOKEN_IDENTITY --token-identity "NocoDB API token for identity"
@@ -502,7 +538,7 @@ phase_officepulse() {
   if ! systemctl is-active --quiet asterisk 2>/dev/null; then
     note "Asterisk is not running on this host (systemctl is-active asterisk). OfficePulse needs it; continuing anyway."
   fi
-  ask PARENT_DOMAIN --parent-domain "Apex domain this platform lives under (X.TLD)"
+  ask_parent_domain
   NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
   ask TOKEN_OFFICEPULSE --token-officepulse "NocoDB API token for officepulse"
   clone_or_update OfficePulseAidaIntegration "$DIR/OfficePulseAidaIntegration"
