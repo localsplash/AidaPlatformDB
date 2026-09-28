@@ -187,9 +187,9 @@ env_set() {
   printf '%s=%s\n' "$key" "$value" >> "$file"
 }
 
-env_get() { # FILE KEY
+env_get() { # FILE KEY -> value, or nothing; never fails (set -e would end the script)
   [ -f "$1" ] || return 0
-  grep -E "^$2=" "$1" | tail -1 | cut -d= -f2- | sed -E "s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/"
+  { grep -E "^$2=" "$1" || true; } | tail -1 | cut -d= -f2- | sed -E "s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/"
 }
 
 # ── Git ──────────────────────────────────────────────────────────────────────
@@ -340,6 +340,13 @@ phase_database() {
   ask_parent_domain
   ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" dev
   NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
+  # Loopback serves applications on this host; other hosts need MySQL on an
+  # address they can reach, and a name for it.
+  if [ -z "$MYSQL_PUBLISH" ] && [ -z "$(env_get "$SELF_DIR/.env" MYSQL_PUBLISH)" ] && ! (( YES )) && { : < /dev/tty; } 2>/dev/null; then
+    local answer
+    read -r -p "Will the applications run on other hosts? MySQL then listens on 0.0.0.0:3306 as lsdb.$PARENT_DOMAIN [y/N] " answer < /dev/tty
+    case ${answer,,} in y|yes) MYSQL_PUBLISH=0.0.0.0:3306 ;; esac
+  fi
 
   log "External networks and the data directories"
   ensure_proxy_network
@@ -381,12 +388,21 @@ phase_database() {
     row_ensure '*' trustedCIDR "$TRUSTED_CIDR" false "IPv4 CIDRs (comma-separated) the platform's servers sit on. One value for the whole platform: every application admits server-to-server callers by it."
   fi
 
-  log "Done. Two things only you can do:"
+  local publish; publish=${MYSQL_PUBLISH:-$(env_get "$SELF_DIR/.env" MYSQL_PUBLISH)}
+  log "Done. What only you can do:"
   note "1. NocoDB holds every secret the platform has. Block $NOCODB_BASE_URL from the public"
   note "   internet at the reverse proxy, or allow only trustedCIDR."
-  note "2. Keep $SELF_DIR/.env (mode 600): it is the MySQL root password."
+  note "2. Keep $SELF_DIR/.env (mode 600): MYSQL_ROOT_PASSWORD lives there and nowhere else — not in"
+  note "   NocoDB, where every application's token could read it. 'install.sh apps' asks for it once,"
+  note "   to create the applications' own MySQL accounts."
   note "   The data is under $data_dir (mysql/, nocodb/): back that path up."
-  [ -n "$MYSQL_PUBLISH" ] && note "3. MySQL listens on $MYSQL_PUBLISH: firewall it to trustedCIDR."
+  if [ -n "$publish" ]; then
+    note "3. MySQL listens on $publish: firewall it to trustedCIDR, and point lsdb.$PARENT_DOMAIN"
+    note "   (the name the applications derive) at this host's private address."
+  else
+    note "3. MySQL listens on 127.0.0.1 only: applications on other hosts cannot reach it. For that,"
+    note "   set MYSQL_PUBLISH=0.0.0.0:3306 in $SELF_DIR/.env and run docker compose up -d here."
+  fi
   return 0
 }
 
@@ -463,14 +479,25 @@ phase_apps() {
   ask TOKEN_ECHO_SERVICE --token-echo-service "NocoDB API token for echo-service"
   NOCODB_TOKEN=${NOCODB_TOKEN:-$TOKEN_IDENTITY}
 
-  local db_local=0
-  if docker container inspect platform-mysql-local >/dev/null 2>&1; then db_local=1; fi
+  # MySQL is local when it is the container from `install.sh database` on this
+  # host; then its root password is in this folder's .env. Anywhere else it is
+  # reached by name and the password is asked for.
+  local db_local=0 db_default="lsdb.$PARENT_DOMAIN"
+  if docker container inspect platform-mysql-local >/dev/null 2>&1; then db_default=platform-mysql-local; fi
+  ask DB_HOST --db-host "MySQL host as the applications reach it" "$db_default"
+  [ "$DB_HOST" = platform-mysql-local ] && db_local=1
   if (( db_local )); then
-    ask DB_HOST --db-host "MySQL host as the applications reach it" platform-mysql-local
     MYSQL_ADMIN_PASSWORD=${MYSQL_ADMIN_PASSWORD:-$(env_get "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD)}
   else
-    ask DB_HOST --db-host "MySQL host as the applications reach it" "lsdb.$PARENT_DOMAIN"
+    # Say so before asking for a password that would only fail later.
+    if ! timeout 5 bash -c "exec 3<>/dev/tcp/$DB_HOST/3306" 2>/dev/null; then
+      note "MySQL at $DB_HOST:3306 is not reachable from this host. On the database host, MySQL must"
+      note "listen beyond loopback (MYSQL_PUBLISH=0.0.0.0:3306 in its AidaPlatformDB/.env, then"
+      note "docker compose up -d; firewall it to trustedCIDR) and $DB_HOST must resolve to it."
+      (( DRY )) || die "cannot reach $DB_HOST:3306"
+    fi
   fi
+  [ -n "$MYSQL_ADMIN_PASSWORD" ] || note "The MySQL root password is MYSQL_ROOT_PASSWORD in the database host's AidaPlatformDB/.env. It is used once here to create the applications' accounts and kept only in echo/.env for Echo's migration job; it is never a NocoDB row."
   ask MYSQL_ADMIN_PASSWORD --mysql-admin-password "MySQL root password on $DB_HOST"
 
   log "External networks and volumes"
