@@ -34,6 +34,7 @@ NOCODB_TOKEN=${NOCODB_TOKEN:-}
 TRUSTED_CIDR=${TRUSTED_CIDR:-}
 DB_HOST=${DB_HOST:-}
 MYSQL_PUBLISH=${MYSQL_PUBLISH:-}
+DATA_DIR=${DATA_DIR:-}
 MYSQL_ADMIN_PASSWORD=${MYSQL_ADMIN_PASSWORD:-}
 TOKEN_IDENTITY=${TOKEN_IDENTITY:-}
 TOKEN_AIDA_ADMIN=${TOKEN_AIDA_ADMIN:-}
@@ -71,6 +72,7 @@ Options
   --db-host HOST           MySQL as the apps reach it (default: platform-mysql-local here, else lsdb.X.TLD)
   --mysql-admin-password P MySQL root password (default: read from this folder's .env)
   --mysql-publish ADDR     database: where MySQL listens, e.g. 0.0.0.0:3306 (default 127.0.0.1:3306)
+  --data-dir PATH          database: host directory for MySQL's and NocoDB's data (default /var/lib/aidaplatformdb)
   --token-identity, --token-aida-admin, --token-aida-agent, --token-echo-web,
   --token-echo-service, --token-officepulse   per-application NocoDB API tokens
   --yes                    never prompt; a missing value is an error
@@ -164,6 +166,11 @@ ensure_proxy_network() {
 ensure_volume() {
   if docker volume inspect "$1" >/dev/null 2>&1; then note "volume $1 exists"; return; fi
   run docker volume create "$1"
+}
+
+ensure_dir() {
+  if [ -d "$1" ]; then note "directory $1 exists"; return; fi
+  run mkdir -p "$1"
 }
 
 # ── .env files ───────────────────────────────────────────────────────────────
@@ -332,18 +339,20 @@ phase_database() {
   ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" dev
   NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
 
-  log "External networks and volumes"
+  log "External networks and the data directories"
   ensure_proxy_network
   ensure_network "$PLATFORM_NETWORK" "$PLATFORM_SUBNET"
   ensure_network "$ECHO_NETWORK" "$ECHO_SUBNET" --internal
-  ensure_volume platform-mysql-data
-  ensure_volume platform-nocodb-data
+  local data_dir=${DATA_DIR:-/var/lib/aidaplatformdb}
+  ensure_dir "$data_dir/mysql"
+  ensure_dir "$data_dir/nocodb"
 
   log "$SELF_DIR/.env"
   env_set "$SELF_DIR/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
   env_set "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD "$(secret)"
   env_set "$SELF_DIR/.env" NC_AUTH_JWT_SECRET "$(secret)"
   [ -n "$MYSQL_PUBLISH" ] && env_set "$SELF_DIR/.env" MYSQL_PUBLISH "$MYSQL_PUBLISH"
+  [ -n "$DATA_DIR" ] && env_set "$SELF_DIR/.env" DATA_DIR "$DATA_DIR"
 
   log "Starting MySQL and NocoDB"
   run docker compose --project-directory "$SELF_DIR" up -d
@@ -374,6 +383,7 @@ phase_database() {
   note "1. NocoDB holds every secret the platform has. Block $NOCODB_BASE_URL from the public"
   note "   internet at the reverse proxy, or allow only trustedCIDR."
   note "2. Keep $SELF_DIR/.env (mode 600): it is the MySQL root password."
+  note "   The data is under $data_dir (mysql/, nocodb/): back that path up."
   [ -n "$MYSQL_PUBLISH" ] && note "3. MySQL listens on $MYSQL_PUBLISH: firewall it to trustedCIDR."
   return 0
 }
@@ -574,6 +584,7 @@ while [ $# -gt 0 ]; do
     --db-host) DB_HOST=$2; shift ;;
     --mysql-admin-password) MYSQL_ADMIN_PASSWORD=$2; shift ;;
     --mysql-publish) MYSQL_PUBLISH=$2; shift ;;
+    --data-dir) DATA_DIR=$(readlink -f "$2"); shift ;;
     --token-identity) TOKEN_IDENTITY=$2; shift ;;
     --token-aida-admin) TOKEN_AIDA_ADMIN=$2; shift ;;
     --token-aida-agent) TOKEN_AIDA_AGENT=$2; shift ;;

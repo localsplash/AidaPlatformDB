@@ -10,13 +10,14 @@
 #          table is the settings store every app reads; public as
 #          NOCODB_BASE_URL (https://nocodb.X.TLD) through the reverse proxy.
 #
-# Networks and data volumes are external: other stacks share the networks,
-# and `down -v` must never be able to delete the data. install.sh creates
-# them; by hand:
+# The data lives on the host, not in Docker: MySQL's data directory and
+# NocoDB's store are bind mounts under DATA_DIR (default /var/lib/aidaplatformdb),
+# where an operator can see, back up and restore them, and where no Compose
+# command can remove them. The networks are external because other stacks
+# share them. install.sh creates all of it; by hand:
+#   mkdir -p /var/lib/aidaplatformdb/mysql /var/lib/aidaplatformdb/nocodb
 #   docker network create --subnet 192.168.112.0/20 platform-local
 #   docker network create --internal --subnet 10.247.23.0/24 echo-local
-#   docker volume create platform-mysql-data
-#   docker volume create platform-nocodb-data
 #
 # Images are pinned by digest so a recreate never upgrades either service by
 # accident. Databases, users and grants belong to the apps that use them (each
@@ -44,7 +45,7 @@ services:
       TZ: ${TZ:-America/Los_Angeles}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set in .env}
     volumes:
-      - mysql-data:/var/lib/mysql
+      - ${DATA_DIR:-/var/lib/aidaplatformdb}/mysql:/var/lib/mysql
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     ports:
@@ -74,7 +75,7 @@ services:
       NC_DISABLE_TELE: "true"
       NC_AUTH_JWT_SECRET: ${NC_AUTH_JWT_SECRET:?set in .env}
     volumes:
-      - nocodb-data:/usr/app/data
+      - ${DATA_DIR:-/var/lib/aidaplatformdb}/nocodb:/usr/app/data
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     ports:
@@ -85,14 +86,6 @@ services:
       - npm_network # the reverse proxy routes nocodb.X.TLD here
     logging: *logging
     restart: unless-stopped
-
-volumes:
-  mysql-data:
-    name: platform-mysql-data
-    external: true
-  nocodb-data:
-    name: platform-nocodb-data
-    external: true
 
 networks:
   platform-local:

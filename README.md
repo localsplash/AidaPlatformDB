@@ -50,9 +50,10 @@ NocoDB run as the two pinned containers in `compose.yaml`; there is no native
 differs in one flag, `--mysql-publish`, so the application hosts can reach MySQL
 as `lsdb.X.TLD`.
 
-1. Creates the external networks and volumes, writes `.env` (generated
-   `MYSQL_ROOT_PASSWORD` and `NC_AUTH_JWT_SECRET`, `NOCODB_BASE_URL` =
-   `https://nocodb.X.TLD`) and starts MySQL and NocoDB.
+1. Creates the external networks and the data directories
+   (`/var/lib/aidaplatformdb/mysql` and `/nocodb`, or `--data-dir`), writes
+   `.env` (generated `MYSQL_ROOT_PASSWORD` and `NC_AUTH_JWT_SECRET`,
+   `NOCODB_BASE_URL` = `https://nocodb.X.TLD`) and starts MySQL and NocoDB.
 2. Stops and asks you to **claim NocoDB** in a browser: the first sign-up
    becomes its super admin. Then create a base named `PlatformConfig`, and
    inside it one API token per application: `installer`, `identity`,
@@ -117,8 +118,14 @@ Its settings are the `officepulse` rows (see that repository's README).
   host, whether that host is a dedicated VM or shared with the applications.
   Images are pinned by digest, so a recreate never upgrades MySQL or NocoDB by
   accident; upgrading is a deliberate edit of the digest, then `up -d`.
-- The data is the two external volumes, `platform-mysql-data` and
-  `platform-nocodb-data`; `down -v` cannot remove them. A dump is
+- The data is on the host, not in Docker: MySQL's data directory is
+  `DATA_DIR/mysql` and NocoDB's store (the PlatformConfig base, its rows, users
+  and API tokens in `noco.db`) is `DATA_DIR/nocodb`, `DATA_DIR` being
+  `/var/lib/aidaplatformdb` unless `.env` says otherwise. Containers and images
+  hold nothing; rebuilding or recreating them never touches these paths, and
+  no Compose command removes a bind mount. Back up that path and the `.env`
+  files (they hold the root password and every app's NocoDB token). A
+  consistent dump is
   `docker exec platform-mysql-local mysqldump --all-databases --single-transaction --routines`
   with the root password from `.env`.
 - Each application is deployed from its own folder: `deploy.sh` for the Echo
