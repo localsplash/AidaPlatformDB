@@ -69,9 +69,14 @@ When it finishes it reminds you that NocoDB holds every secret the platform
 has: block it from the public internet at the reverse proxy, or allow only
 `trustedCIDR`.
 
-`--mysql-publish 0.0.0.0:3306` is for a platform whose applications run on
-other hosts; they reach MySQL as `lsdb.X.TLD`. Firewall that port to
-`trustedCIDR`.
+When the applications will run on other hosts, answer yes to the question
+(or pass `--mysql-publish 0.0.0.0:3306`): MySQL then listens beyond loopback,
+and they reach it as `lsdb.X.TLD`, which you point at this host's private
+address. Firewall that port to `trustedCIDR`.
+
+The MySQL root password lives in this host's `.env` and nowhere else — not in
+NocoDB, where every application's token could read it. The `apps` phase asks
+for it once.
 
 ### b) The application host — `./install.sh apps`
 
@@ -94,8 +99,12 @@ apps then reach MySQL by container name).
    ```
 3. Writes each `.env` with `NOCODB_BASE_URL` and that application's token, and
    Echo's with the generated MySQL passwords its jobs create.
-4. Creates the MySQL accounts (`identity`, `aida_admin_app`; Echo's are created
-   by its own jobs at deploy) and seeds the rows the applications need to
+4. Asks for the MySQL root password (from the database host's
+   `AidaPlatformDB/.env`; found automatically when MySQL runs on this host),
+   checks MySQL is reachable first, and creates the MySQL accounts
+   (`identity`, `aida_admin_app`; Echo's are created by its own jobs at
+   deploy). The root password is kept only in `echo/.env` for Echo's migration
+   job. Then it seeds the rows the applications need to
    start: database coordinates, the shared `IDENTITY_CLIENT_SECRET`, session
    and webhook secrets, the public URLs derived from `PARENT_DOMAIN`
    (`https://identity.X.TLD`, `https://aida-admin.X.TLD`,
