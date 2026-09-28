@@ -146,7 +146,11 @@ Its settings are the `officepulse` rows (see that repository's README).
   `platform-mysql-data` / `platform-nocodb-data` volumes) runs
   `./install.sh migrate-data` once: it stops the pair, copies the volumes to
   `DATA_DIR` with ownership intact, restarts on the host directories, lists the
-  databases it now serves, and removes the volumes.
+  databases it now serves, and removes the volumes. `install.sh database`
+  refuses to start while data is still in a volume and the directory is empty,
+  and `migrate-data` recognises a fresh, empty instance that was started on the
+  empty directory by mistake, sets it aside (`…/mysql.empty-<stamp>`) and puts
+  the volume's data in its place.
 - The data is on the host, not in Docker: MySQL's data directory is
   `DATA_DIR/mysql` and NocoDB's store (the PlatformConfig base, its rows, users
   and API tokens in `noco.db`) is `DATA_DIR/nocodb`, `DATA_DIR` being
