@@ -45,7 +45,11 @@ services:
       TZ: ${TZ:-America/Los_Angeles}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set in .env}
     volumes:
-      - ${DATA_DIR:-/var/lib/aidaplatformdb}/mysql:/var/lib/mysql
+      - type: bind
+        source: /var/lib/aidaplatformdb/mysql
+        target: /var/lib/mysql
+        bind:
+          create_host_path: false
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     ports:
@@ -75,7 +79,11 @@ services:
       NC_DISABLE_TELE: "true"
       NC_AUTH_JWT_SECRET: ${NC_AUTH_JWT_SECRET:?set in .env}
     volumes:
-      - ${DATA_DIR:-/var/lib/aidaplatformdb}/nocodb:/usr/app/data
+      - type: bind
+        source: /var/lib/aidaplatformdb/nocodb
+        target: /usr/app/data
+        bind:
+          create_host_path: false
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     ports:
