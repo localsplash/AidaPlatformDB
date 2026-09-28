@@ -118,6 +118,11 @@ Its settings are the `officepulse` rows (see that repository's README).
   host, whether that host is a dedicated VM or shared with the applications.
   Images are pinned by digest, so a recreate never upgrades MySQL or NocoDB by
   accident; upgrading is a deliberate edit of the digest, then `up -d`.
+- A host set up before the data moved onto the host (MySQL and NocoDB on the
+  `platform-mysql-data` / `platform-nocodb-data` volumes) runs
+  `./install.sh migrate-data` once: it stops the pair, copies the volumes to
+  `DATA_DIR` with ownership intact, restarts on the host directories, lists the
+  databases it now serves, and removes the volumes.
 - The data is on the host, not in Docker: MySQL's data directory is
   `DATA_DIR/mysql` and NocoDB's store (the PlatformConfig base, its rows, users
   and API tokens in `noco.db`) is `DATA_DIR/nocodb`, `DATA_DIR` being
