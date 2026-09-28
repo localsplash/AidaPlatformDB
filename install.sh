@@ -24,8 +24,9 @@ SELF=$(readlink -f "$0")
 SELF_DIR=$(cd "$(dirname "$SELF")" && pwd)
 GIT_BASE=${AIDA_GIT_BASE:-https://github.com/localsplash}
 
-BRANCH=main
-DIR=/opt/local
+BRANCH=""
+DIR=/opt
+DIR_GIVEN=0
 YES=0
 DRY=0
 NO_DEPLOY=0
@@ -64,8 +65,8 @@ usage() {
   cat <<'EOF'
 
 Options
-  --branch NAME            git branch for every repository (default main)
-  --dir PATH               install root (default /opt/local)
+  --branch NAME            git branch for every repository (default: this checkout's branch, else main)
+  --dir PATH               install root (default: this checkout's parent, else /opt)
   --parent-domain X.TLD    the domain this platform is deployed under
   --environment-name NAME  dev | staging | prod
   --nocodb-base-url URL    https://nocodb.X.TLD (default derived from --parent-domain)
@@ -87,7 +88,8 @@ EOF
 log()  { printf '\n==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 die()  { echo "install: $*" >&2; exit 2; }
-run()  { if (( DRY )); then echo "    + $*"; else "$@"; fi; }
+# Dry runs print the command with secret-looking values masked.
+run()  { if (( DRY )); then printf '    + %s\n' "$(printf '%s ' "$@" | sed -E "s/((PASSWORD|SECRET|TOKEN|PWD)=)[^ ]*/\\1<secret>/g; s/(IDENTIFIED BY ')[^']*'/\\1<secret>'/g; s#(mysql://[^:]+:)[^@]*@#\\1<secret>@#g")"; else "$@"; fi; }
 have() { command -v "$1" >/dev/null 2>&1; }
 secret() { openssl rand -hex 32; }
 
@@ -228,8 +230,18 @@ nc() { # PATH [curl args]
 
 ensure_platformconfig() {
   [ -n "$NOCODB_TOKEN" ] || die "a NocoDB API token is required to reach $BASE_NAME"
-  if (( DRY )); then note "would find or create $BASE_NAME/$TABLE_NAME at ${NOCODB_API_URL:-$NOCODB_BASE_URL}"; TABLE_ID=dry; ROWS_JSON='[]'; return; fi
   local bases base_id tables
+  if (( DRY )); then
+    # Read what is there so the dry run shows the real path; never create.
+    TABLE_ID=dry; ROWS_JSON='[]'
+    bases=$(nc /api/v2/meta/bases 2>/dev/null) || { note "would read $BASE_NAME/$TABLE_NAME at ${NOCODB_API_URL:-$NOCODB_BASE_URL} (not reachable now: assuming no rows)"; return; }
+    base_id=$(jq -r --arg t "$BASE_NAME" '[.list[] | select(.title==$t)] | .[0].id // ""' <<<"$bases")
+    [ -n "$base_id" ] || { note "would need base $BASE_NAME (not there yet)"; return; }
+    tables=$(nc "/api/v2/meta/bases/$base_id/tables" 2>/dev/null) || return 0
+    TABLE_ID=$(jq -r --arg t "$TABLE_NAME" '[.list[] | select(.title==$t)] | .[0].id // ""' <<<"$tables")
+    [ -n "$TABLE_ID" ] || { note "would create table $TABLE_NAME"; TABLE_ID=dry; return; }
+    rows_load; note "base $BASE_NAME and table $TABLE_NAME found ($(jq length <<<"$ROWS_JSON") rows)"; TABLE_ID=dry; return
+  fi
   bases=$(nc /api/v2/meta/bases) || die "NocoDB at ${NOCODB_API_URL:-$NOCODB_BASE_URL} did not answer or rejected the token"
   base_id=$(jq -r --arg t "$BASE_NAME" '[.list[] | select(.title==$t)] | if length==1 then .[0].id elif length==0 then "" else "dup" end' <<<"$bases")
   [ "$base_id" != dup ] && [ "$base_id" != null ] || die "more than one NocoDB base is named $BASE_NAME"
@@ -332,6 +344,75 @@ compose_up() { # DIR
   run docker compose --project-directory "$1" up -d --build
 }
 
+# ── Application databases and accounts, created where root is ───────────────
+
+# repo_script REPO LOCAL_DIR SCRIPT [docker -e ...]: runs an application's own
+# scripts/<SCRIPT> (its checkout beside this one when present, otherwise a
+# shallow clone at --branch) in a throwaway MySQL client on the platform network.
+repo_script() {
+  local repo=$1 local_dir=$2 script=$3; shift 3
+  local src=$local_dir tmp=""
+  if [ ! -f "$src/scripts/$script" ]; then
+    if (( DRY )); then note "would fetch $repo@$BRANCH for scripts/$script"; src=/nonexistent; else
+      tmp=$(mktemp -d); git clone -q --depth 1 -b "$BRANCH" "$GIT_BASE/$repo.git" "$tmp/$repo"; src="$tmp/$repo"
+    fi
+  fi
+  note "$repo/scripts/$script"
+  run docker run --rm --network "$PLATFORM_NETWORK" -v "$src/scripts:/scripts:ro" "$@" mysql:8.4 bash "/scripts/$script"
+  [ -n "$tmp" ] && rm -rf "$tmp"
+  return 0
+}
+
+# Every application's database and account, created here with root, with the
+# passwords in the rows the applications already read. The applications' host
+# then needs no MySQL credential of its own: Echo's deploy-time jobs run as
+# echo_admin, an account with all rights on echo_db and nothing else.
+database_accounts() {
+  local root; root=$(env_get "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD)
+  [ -n "$root" ] || (( DRY )) || die "MYSQL_ROOT_PASSWORD is missing from $SELF_DIR/.env"
+  local publish; publish=${MYSQL_PUBLISH:-$(env_get "$SELF_DIR/.env" MYSQL_PUBLISH)}
+  # Published, the applications derive lsdb.<PARENT_DOMAIN> and need no row;
+  # on loopback they share this host and use the container's name.
+  local app_db_host="lsdb.$PARENT_DOMAIN"
+  if [ -z "$publish" ]; then
+    app_db_host=platform-mysql-local
+    row_ensure identity DB_HOST "$app_db_host" false "MySQL host holding platform_db. Unset derives lsdb.<PARENT_DOMAIN>."
+    row_ensure echo DB_HOST "$app_db_host" false "Echo application database host. Unset derives lsdb.<PARENT_DOMAIN>."
+  fi
+  local client=(docker run --rm --network "$PLATFORM_NETWORK" -e MYSQL_PWD="$root")
+
+  log "Identity: platform_db and the identity account"
+  row_ensure identity DB_USER identity false "MySQL user for platform_db; created by identity/scripts/db-users.sh."
+  row_ensure identity DB_NAME platform_db false "Identity's database."
+  row_default identity DB_PASSWORD "$(secret)" true "Password for DB_USER; the same value identity/scripts/db-users.sh sets."
+  repo_script identity "$DIR/identity" db-users.sh -e DB_HOST=platform-mysql-local -e DB_PASSWORD="$ROW_VALUE" -e MYSQL_ADMIN_PASSWORD="$root"
+
+  log "AidaAdmin: aida_admin_db and the aida_admin_app account"
+  row_default aida-admin AIDA_ADMIN_DATABASE_URL "mysql://aida_admin_app:$(secret)@$app_db_host:3306/aida_admin_db" true "AidaAdmin's own store (OAuth state, receipts, audit); the account is created by AidaAdmin/scripts/db-users.sh from this URL."
+  repo_script AidaAdmin "$DIR/aida/AidaAdmin" db-users.sh -e AIDA_ADMIN_DATABASE_URL="$ROW_VALUE" -e DB_HOST=platform-mysql-local -e MYSQL_ADMIN_PASSWORD="$root"
+
+  log "Echo: echo_db schema, echo_web and echo_service, and echo_admin for its deploy-time jobs"
+  row_ensure echo DB_NAME echo_db false "Echo application database; restart the pool after changes."
+  row_ensure echo-web DB_USER echo_web false "EchoWeb's read-only account, created by AidaPlatformDB/echo's db-users job."
+  row_ensure echo-service DB_USER echo_service false "EchoService's account, created by AidaPlatformDB/echo's db-users job."
+  row_default echo-web DB_PASSWORD "$(secret)" true "Same value as ECHO_WEB_DB_PASSWORD in the Echo environment's .env."
+  local web_pw=$ROW_VALUE
+  row_default echo-service DB_PASSWORD "$(secret)" true "Same value as ECHO_SERVICE_DB_PASSWORD in the Echo environment's .env."
+  local service_pw=$ROW_VALUE
+  # Schema first: the read-only grants name the routines the migrations create.
+  note "echo/scripts/migrate.sh"
+  run "${client[@]}" -v "$SELF_DIR/echo/init:/init:ro" -v "$SELF_DIR/echo/scripts:/scripts:ro" \
+    -e DB_HOST=platform-mysql-local -e DB_USER=root -e MYSQL_DATABASE=echo_db -e MIGRATIONS_DIR=/init mysql:8.4 bash /scripts/migrate.sh
+  note "echo/scripts/db-users.sh"
+  run "${client[@]}" -v "$SELF_DIR/echo/scripts:/scripts:ro" -e DB_HOST=platform-mysql-local -e MYSQL_ADMIN_PASSWORD="$root" \
+    -e ECHO_WEB_DB_PASSWORD="$web_pw" -e ECHO_SERVICE_DB_PASSWORD="$service_pw" mysql:8.4 bash /scripts/db-users.sh
+  row_ensure echo MYSQL_ADMIN_USER echo_admin false "Account the Echo environment's migration and account jobs run as: all rights on echo_db and CREATE USER, nothing else. Never the MySQL root."
+  row_default echo MYSQL_ADMIN_PASSWORD "$(secret)" true "Password for MYSQL_ADMIN_USER; the Echo environment's .env carries the same value for its jobs."
+  local admin_pw=$ROW_VALUE
+  note "echo_admin"
+  run "${client[@]}" mysql:8.4 mysql -h platform-mysql-local -uroot -e "CREATE USER IF NOT EXISTS 'echo_admin'@'%' IDENTIFIED BY '$admin_pw'; ALTER USER 'echo_admin'@'%' IDENTIFIED BY '$admin_pw'; GRANT ALL PRIVILEGES ON \`echo\\_db\`.* TO 'echo_admin'@'%' WITH GRANT OPTION; GRANT CREATE USER ON *.* TO 'echo_admin'@'%';"
+}
+
 # ── Phase a: the database host ───────────────────────────────────────────────
 
 phase_database() {
@@ -386,15 +467,17 @@ phase_database() {
     row_ensure '*' PARENT_DOMAIN "$PARENT_DOMAIN" false "Apex domain (X.TLD) every application lives under; apps derive https://<app>.<PARENT_DOMAIN> from it."
     row_ensure '*' ENVIRONMENT_NAME "$ENVIRONMENT_NAME" false "dev, staging or prod; shown by the applications so nobody mistakes one environment for another."
     row_ensure '*' trustedCIDR "$TRUSTED_CIDR" false "IPv4 CIDRs (comma-separated) the platform's servers sit on. One value for the whole platform: every application admits server-to-server callers by it."
+    database_accounts
   fi
 
   local publish; publish=${MYSQL_PUBLISH:-$(env_get "$SELF_DIR/.env" MYSQL_PUBLISH)}
   log "Done. What only you can do:"
   note "1. NocoDB holds every secret the platform has. Block $NOCODB_BASE_URL from the public"
   note "   internet at the reverse proxy, or allow only trustedCIDR."
-  note "2. Keep $SELF_DIR/.env (mode 600): MYSQL_ROOT_PASSWORD lives there and nowhere else — not in"
-  note "   NocoDB, where every application's token could read it. 'install.sh apps' asks for it once,"
-  note "   to create the applications' own MySQL accounts."
+  note "2. The MySQL root password is: $( (( DRY )) && echo '<generated>' || env_get "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD )"
+  note "   It lives in $SELF_DIR/.env (mode 600) and nowhere else — not in NocoDB, where every"
+  note "   application's token could read it. Nothing else needs it: the applications' accounts were"
+  note "   created here and their passwords are their own rows."
   note "   The data is under $data_dir (mysql/, nocodb/): back that path up."
   if [ -n "$publish" ]; then
     note "3. MySQL listens on $publish: firewall it to trustedCIDR, and point lsdb.$PARENT_DOMAIN"
@@ -479,26 +562,42 @@ phase_apps() {
   ask TOKEN_ECHO_SERVICE --token-echo-service "NocoDB API token for echo-service"
   NOCODB_TOKEN=${NOCODB_TOKEN:-$TOKEN_IDENTITY}
 
-  # MySQL is local when it is the container from `install.sh database` on this
-  # host; then its root password is in this folder's .env. Anywhere else it is
-  # reached by name and the password is asked for.
-  local db_local=0 db_default="lsdb.$PARENT_DOMAIN"
+  log "PlatformConfig"
+  ensure_platformconfig
+  row_ensure '*' PARENT_DOMAIN "$PARENT_DOMAIN" false "Apex domain (X.TLD) every application lives under; apps derive https://<app>.<PARENT_DOMAIN> from it."
+  row_ensure '*' ENVIRONMENT_NAME "$ENVIRONMENT_NAME" false "dev, staging or prod; shown by the applications so nobody mistakes one environment for another."
+  local current_cidr; current_cidr=$(row_get '*' trustedCIDR)
+  ask TRUSTED_CIDR --trusted-cidr "trustedCIDR: the networks the platform's servers sit on" "${current_cidr:-$(default_trusted_cidr)}"
+  row_ensure '*' trustedCIDR "$TRUSTED_CIDR" false "IPv4 CIDRs (comma-separated) the platform's servers sit on. One value for the whole platform: every application admits server-to-server callers by it."
+
+  # MySQL: the container from `install.sh database` when it is on this host,
+  # otherwise the name the rows (or the platform convention) give it.
+  local db_local=0 db_default
+  db_default=$(row_get echo DB_HOST); db_default=${db_default:-lsdb.$PARENT_DOMAIN}
   if docker container inspect platform-mysql-local >/dev/null 2>&1; then db_default=platform-mysql-local; fi
   ask DB_HOST --db-host "MySQL host as the applications reach it" "$db_default"
   [ "$DB_HOST" = platform-mysql-local ] && db_local=1
-  if (( db_local )); then
-    MYSQL_ADMIN_PASSWORD=${MYSQL_ADMIN_PASSWORD:-$(env_get "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD)}
-  else
-    # Say so before asking for a password that would only fail later.
-    if ! timeout 5 bash -c "exec 3<>/dev/tcp/$DB_HOST/3306" 2>/dev/null; then
-      note "MySQL at $DB_HOST:3306 is not reachable from this host. On the database host, MySQL must"
-      note "listen beyond loopback (MYSQL_PUBLISH=0.0.0.0:3306 in its AidaPlatformDB/.env, then"
-      note "docker compose up -d; firewall it to trustedCIDR) and $DB_HOST must resolve to it."
-      (( DRY )) || die "cannot reach $DB_HOST:3306"
-    fi
+  if ! (( db_local )) && ! timeout 5 bash -c "exec 3<>/dev/tcp/$DB_HOST/3306" 2>/dev/null; then
+    note "MySQL at $DB_HOST:3306 is not reachable from this host. On the database host, MySQL must"
+    note "listen beyond loopback (MYSQL_PUBLISH=0.0.0.0:3306 in its AidaPlatformDB/.env, then"
+    note "docker compose up -d; firewall it to trustedCIDR) and $DB_HOST must resolve to it."
+    (( DRY )) || die "cannot reach $DB_HOST:3306"
   fi
-  [ -n "$MYSQL_ADMIN_PASSWORD" ] || note "The MySQL root password is MYSQL_ROOT_PASSWORD in the database host's AidaPlatformDB/.env. It is used once here to create the applications' accounts and kept only in echo/.env for Echo's migration job; it is never a NocoDB row."
-  ask MYSQL_ADMIN_PASSWORD --mysql-admin-password "MySQL root password on $DB_HOST"
+  # The database host created every account and left the passwords in the rows,
+  # so nothing is asked here. Without those rows (a database host set up before
+  # that step existed) the accounts are created from here with root instead.
+  local accounts_done=0 admin_user admin_pw
+  admin_pw=$(row_get echo MYSQL_ADMIN_PASSWORD)
+  if [ -n "$admin_pw" ]; then
+    admin_user=$(row_get echo MYSQL_ADMIN_USER); admin_user=${admin_user:-echo_admin}; accounts_done=1
+    note "MySQL accounts exist (created by 'install.sh database'); Echo's jobs run as $admin_user"
+  else
+    admin_user=root
+    if (( db_local )); then MYSQL_ADMIN_PASSWORD=${MYSQL_ADMIN_PASSWORD:-$(env_get "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD)}; fi
+    [ -n "$MYSQL_ADMIN_PASSWORD" ] || note "The database host has not created the applications' accounts (re-run 'install.sh database' there, or give its MYSQL_ROOT_PASSWORD from AidaPlatformDB/.env here, used once and kept only in echo/.env for Echo's jobs)."
+    ask MYSQL_ADMIN_PASSWORD --mysql-admin-password "MySQL root password on $DB_HOST"
+    admin_pw=$MYSQL_ADMIN_PASSWORD
+  fi
 
   log "External networks and volumes"
   ensure_proxy_network
@@ -509,6 +608,11 @@ phase_apps() {
   ensure_volume echo-service-logs
 
   log "Checkouts ($BRANCH)"
+  # The Echo environment includes ../AidaPlatformDB/echo/compose.yaml, so this
+  # checkout has to sit beside it under that name.
+  if [ "$(dirname "$SELF_DIR")" = "$DIR" ] && [ "$(basename "$SELF_DIR")" != AidaPlatformDB ]; then
+    die "this checkout is $SELF_DIR; the Echo environment expects it at $DIR/AidaPlatformDB — rename it"
+  fi
   [ "$SELF_DIR" = "$DIR/AidaPlatformDB" ] || clone_or_update AidaPlatformDB "$DIR/AidaPlatformDB"
   clone_or_update identity "$DIR/identity"
   clone_or_update AidaAdmin "$DIR/aida/AidaAdmin"
@@ -517,6 +621,7 @@ phase_apps() {
   clone_or_update EchoService "$DIR/echo/EchoService"
   clone_or_update EchoMedia "$DIR/echo/EchoMedia"
   local f
+  [ -f "$DIR/echo/EchoWeb/deploy/environment/compose.yaml" ] || die "EchoWeb@$BRANCH has no deploy/environment (the Echo environment template): use a branch that has it, e.g. --branch dev"
   for f in compose.yaml web.host.yaml service.host.yaml deploy.sh; do
     if [ ! -e "$DIR/echo/$f" ]; then
       note "echo/$f from EchoWeb/deploy/environment"
@@ -539,22 +644,18 @@ phase_apps() {
   env_set "$echo_env" ECHO_MEDIA_VOLUME echo-media-data
   env_set "$echo_env" ECHO_SERVICE_LOGS_VOLUME echo-service-logs
   env_set "$echo_env" ECHO_DB_HOST "$DB_HOST"
-  env_set "$echo_env" MYSQL_ADMIN_PASSWORD "$MYSQL_ADMIN_PASSWORD"
-  env_set "$echo_env" ECHO_WEB_DB_PASSWORD "$(secret)"
-  env_set "$echo_env" ECHO_SERVICE_DB_PASSWORD "$(secret)"
+  env_set "$echo_env" MYSQL_ADMIN_USER "$admin_user"
+  env_set "$echo_env" MYSQL_ADMIN_PASSWORD "$admin_pw"
+  local web_pw service_pw
+  web_pw=$(row_get echo-web DB_PASSWORD); service_pw=$(row_get echo-service DB_PASSWORD)
+  env_set "$echo_env" ECHO_WEB_DB_PASSWORD "${web_pw:-$(secret)}"
+  env_set "$echo_env" ECHO_SERVICE_DB_PASSWORD "${service_pw:-$(secret)}"
   env_set "$echo_env" ECHO_WEB_TAG '${ENVIRONMENT_NAME}-${ECHO_WEB_SHORT:-${BUILD_REVISION_SHORT-local}}'
   env_set "$echo_env" ECHO_SERVICE_TAG '${ENVIRONMENT_NAME}-${ECHO_SERVICE_SHORT:-${BUILD_REVISION_SHORT-local}}'
   env_set "$echo_env" ECHO_MEDIA_TAG '${ENVIRONMENT_NAME}-${ECHO_MEDIA_SHORT:-${BUILD_REVISION_SHORT-local}}'
   env_set "$echo_env" ENVIRONMENT_NAME "$ENVIRONMENT_NAME"
 
   log "PlatformConfig rows"
-  ensure_platformconfig
-  row_ensure '*' PARENT_DOMAIN "$PARENT_DOMAIN" false "Apex domain (X.TLD) every application lives under; apps derive https://<app>.<PARENT_DOMAIN> from it."
-  row_ensure '*' ENVIRONMENT_NAME "$ENVIRONMENT_NAME" false "dev, staging or prod; shown by the applications so nobody mistakes one environment for another."
-  local current_cidr; current_cidr=$(row_get '*' trustedCIDR)
-  ask TRUSTED_CIDR --trusted-cidr "trustedCIDR: the networks the platform's servers sit on" "${current_cidr:-$(default_trusted_cidr)}"
-  row_ensure '*' trustedCIDR "$TRUSTED_CIDR" false "IPv4 CIDRs (comma-separated) the platform's servers sit on. One value for the whole platform: every application admits server-to-server callers by it."
-
   # One shared secret for redeeming Identity handoff codes; Identity mints it if absent.
   local client_secret identity_db_password aida_admin_password aida_admin_url
   row_default identity IDENTITY_CLIENT_SECRET "$(secret)" true "Shared secret applications present at POST /api/token while IDENTITY_APP_AUTH_MODE is secret or dual."
@@ -562,23 +663,26 @@ phase_apps() {
   row_ensure echo-web IDENTITY_CLIENT_SECRET "$client_secret" true "Shared secret EchoWeb presents to Identity /api/token; same value as identity/IDENTITY_CLIENT_SECRET."
   row_ensure aida-admin ID_CLIENT_SECRET "$client_secret" true "Shared secret AidaAdmin presents to Identity /api/token; same value as identity/IDENTITY_CLIENT_SECRET."
 
-  # Database coordinates. A host the apps can derive (lsdb.<PARENT_DOMAIN>) needs no row.
-  if [ "$DB_HOST" != "lsdb.$PARENT_DOMAIN" ]; then
-    row_ensure identity DB_HOST "$DB_HOST" false "MySQL host holding platform_db. Unset derives lsdb.<PARENT_DOMAIN>."
-    row_ensure echo DB_HOST "$DB_HOST" false "Echo application database host. Unset derives lsdb.<PARENT_DOMAIN>."
+  # Database coordinates and accounts: normally rows the database host wrote.
+  # The fallback (no such rows) creates them from here with root.
+  if ! (( accounts_done )); then
+    if [ "$DB_HOST" != "lsdb.$PARENT_DOMAIN" ]; then
+      row_ensure identity DB_HOST "$DB_HOST" false "MySQL host holding platform_db. Unset derives lsdb.<PARENT_DOMAIN>."
+      row_ensure echo DB_HOST "$DB_HOST" false "Echo application database host. Unset derives lsdb.<PARENT_DOMAIN>."
+    fi
+    row_ensure identity DB_USER identity false "MySQL user for platform_db; created by identity/scripts/db-users.sh."
+    row_ensure identity DB_NAME platform_db false "Identity's database."
+    row_default identity DB_PASSWORD "$(secret)" true "Password for DB_USER; the same value identity/scripts/db-users.sh sets."
+    identity_db_password=$ROW_VALUE
+    row_ensure echo DB_NAME echo_db false "Echo application database; restart the pool after changes."
+    row_ensure echo-web DB_USER echo_web false "EchoWeb's read-only account, created by AidaPlatformDB/echo's db-users job."
+    row_ensure echo-web DB_PASSWORD "$(env_get "$echo_env" ECHO_WEB_DB_PASSWORD)" true "Same value as ECHO_WEB_DB_PASSWORD in the Echo environment's .env."
+    row_ensure echo-service DB_USER echo_service false "EchoService's account, created by AidaPlatformDB/echo's db-users job."
+    row_ensure echo-service DB_PASSWORD "$(env_get "$echo_env" ECHO_SERVICE_DB_PASSWORD)" true "Same value as ECHO_SERVICE_DB_PASSWORD in the Echo environment's .env."
+    aida_admin_password=$(secret)
+    row_default aida-admin AIDA_ADMIN_DATABASE_URL "mysql://aida_admin_app:$aida_admin_password@$DB_HOST:3306/aida_admin_db" true "AidaAdmin's own store (OAuth state, receipts, audit); the account is created by AidaAdmin/scripts/db-users.sh from this URL."
+    aida_admin_url=$ROW_VALUE
   fi
-  row_ensure identity DB_USER identity false "MySQL user for platform_db; created by identity/scripts/db-users.sh."
-  row_ensure identity DB_NAME platform_db false "Identity's database."
-  row_default identity DB_PASSWORD "$(secret)" true "Password for DB_USER; the same value identity/scripts/db-users.sh sets."
-  identity_db_password=$ROW_VALUE
-  row_ensure echo DB_NAME echo_db false "Echo application database; restart the pool after changes."
-  row_ensure echo-web DB_USER echo_web false "EchoWeb's read-only account, created by AidaPlatformDB/echo's db-users job."
-  row_ensure echo-web DB_PASSWORD "$(env_get "$echo_env" ECHO_WEB_DB_PASSWORD)" true "Same value as ECHO_WEB_DB_PASSWORD in the Echo environment's .env."
-  row_ensure echo-service DB_USER echo_service false "EchoService's account, created by AidaPlatformDB/echo's db-users job."
-  row_ensure echo-service DB_PASSWORD "$(env_get "$echo_env" ECHO_SERVICE_DB_PASSWORD)" true "Same value as ECHO_SERVICE_DB_PASSWORD in the Echo environment's .env."
-  aida_admin_password=$(secret)
-  row_default aida-admin AIDA_ADMIN_DATABASE_URL "mysql://aida_admin_app:$aida_admin_password@$DB_HOST:3306/aida_admin_db" true "AidaAdmin's own store (OAuth state, receipts, audit); the account is created by AidaAdmin/scripts/db-users.sh from this URL."
-  aida_admin_url=$ROW_VALUE
 
   # Everything else the applications need before their first start.
   local carrier
@@ -598,14 +702,16 @@ phase_apps() {
   row_ensure aida-agent AIDA_TTS_MODEL deepgram/aura-2 false "LiveKit Inference text-to-speech model."
   row_ensure aida-agent AIDA_TTS_VOICE asteria false "Voice for AIDA_TTS_MODEL."
 
-  log "MySQL accounts on $DB_HOST"
-  run docker run --rm --network "$PLATFORM_NETWORK" -v "$DIR/identity/scripts:/scripts:ro" \
-    -e DB_HOST="$DB_HOST" -e DB_PASSWORD="$identity_db_password" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD" \
-    mysql:8.4 bash /scripts/db-users.sh
-  run docker run --rm --network "$PLATFORM_NETWORK" -v "$DIR/aida/AidaAdmin/scripts:/scripts:ro" \
-    -e AIDA_ADMIN_DATABASE_URL="$aida_admin_url" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD" \
-    mysql:8.4 bash /scripts/db-users.sh
-  note "echo_web and echo_service are created by the Echo environment's own jobs at deploy"
+  if ! (( accounts_done )); then
+    log "MySQL accounts on $DB_HOST (fallback: created from here with root)"
+    run docker run --rm --network "$PLATFORM_NETWORK" -v "$DIR/identity/scripts:/scripts:ro" \
+      -e DB_HOST="$DB_HOST" -e DB_PASSWORD="$identity_db_password" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD" \
+      mysql:8.4 bash /scripts/db-users.sh
+    run docker run --rm --network "$PLATFORM_NETWORK" -v "$DIR/aida/AidaAdmin/scripts:/scripts:ro" \
+      -e AIDA_ADMIN_DATABASE_URL="$aida_admin_url" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD" \
+      mysql:8.4 bash /scripts/db-users.sh
+    note "echo_web and echo_service are created by the Echo environment's own jobs at deploy"
+  fi
 
   if (( NO_DEPLOY )); then log "--no-deploy: stopping before build and start"; else
     log "Building and starting"
@@ -662,7 +768,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     database|apps|officepulse|all|migrate-data) PHASE=$1 ;;
     --branch) BRANCH=$2; shift ;;
-    --dir) DIR=$(readlink -f "$2"); shift ;;
+    --dir) DIR=$(readlink -f "$2"); DIR_GIVEN=1; shift ;;
     --parent-domain) PARENT_DOMAIN=$2; shift ;;
     --environment-name) ENVIRONMENT_NAME=$2; shift ;;
     --nocodb-base-url) NOCODB_BASE_URL=${2%/}; shift ;;
@@ -688,6 +794,15 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$PHASE" ] || { usage; exit 2; }
 case $ENVIRONMENT_NAME in ""|dev|staging|prod) ;; *) die "--environment-name must be dev, staging or prod" ;; esac
+
+# Run from a checkout, the install root is wherever that checkout was cloned
+# (the applications go beside it: /opt/AidaPlatformDB -> /opt/identity, ...)
+# and the branch is the checkout's own, so a dev checkout installs dev apps.
+if [ -f "$SELF_DIR/compose.yaml" ] && [ -d "$SELF_DIR/echo" ]; then
+  (( DIR_GIVEN )) || DIR=$(dirname "$SELF_DIR")
+  [ -n "$BRANCH" ] || BRANCH=$(git -C "$SELF_DIR" branch --show-current 2>/dev/null || true)
+fi
+BRANCH=${BRANCH:-main}
 
 # Piped from GitHub rather than run from a checkout: get the checkout this
 # script is the front of (compose.yaml, echo/, and itself) and carry on there.
