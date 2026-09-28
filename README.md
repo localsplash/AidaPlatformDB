@@ -29,13 +29,16 @@ curl -fsSL https://raw.githubusercontent.com/localsplash/AidaPlatformDB/main/ins
   | bash -s -- database          # or: apps, officepulse, all; --help for the flags
 ```
 
-That clones this repository into `/opt/local/AidaPlatformDB` (`--dir` moves the
+That clones this repository into `/opt/AidaPlatformDB` (`--dir` moves the
 root) and continues from the checkout, so every host — database, application,
 PBX — starts the same way and ends up with the same folder. From an existing
-checkout, `./install.sh <phase>` does the same.
+checkout, `./install.sh <phase>` does the same, with the install root being
+that checkout's parent.
 
-Every repository is taken from its `main` branch; `--branch dev` takes `dev`
-(and the one-liner's URL should then name `dev` too).
+Every repository is taken from the branch the AidaPlatformDB checkout is on
+(`main` for the one-liner unless `--branch` says otherwise), so a `dev`
+checkout installs `dev` everywhere; the one-liner's URL should name the same
+branch.
 Values not given as flags are asked for; `--yes` makes missing values an error
 instead. `--dry-run` prints what would happen. Re-running is safe: existing
 `.env` values, rows with a value and accounts are kept, and only what is missing
@@ -64,6 +67,19 @@ as `lsdb.X.TLD`.
 3. With the installer token, creates the `cfg_tbl_Setting` table in that base
    (found by name; nothing is recreated) and seeds the global rows:
    `ENVIRONMENT_NAME`, `PARENT_DOMAIN`, `trustedCIDR`.
+4. Creates every application's database and MySQL account here, where root
+   is — `platform_db`/`identity`, `aida_admin_db`/`aida_admin_app`, and
+   `echo_db` (schema applied) with `echo_web`, `echo_service` and
+   `echo_admin` — using each application's own `scripts/db-users.sh`, and
+   writes the generated passwords to the rows the applications read
+   (`identity/DB_PASSWORD`, `aida-admin/AIDA_ADMIN_DATABASE_URL`,
+   `echo-web/DB_PASSWORD`, `echo-service/DB_PASSWORD`,
+   `echo/MYSQL_ADMIN_PASSWORD`). `echo_admin` has all rights on `echo_db`
+   and `CREATE USER`, nothing more: it is what the Echo environment's
+   deploy-time migration and account jobs run as, so the MySQL root password
+   never leaves this host.
+5. Prints the MySQL root password (it is also `MYSQL_ROOT_PASSWORD` in
+   `.env`) and what only you can do next.
 
 When it finishes it reminds you that NocoDB holds every secret the platform
 has: block it from the public internet at the reverse proxy, or allow only
@@ -75,8 +91,8 @@ and they reach it as `lsdb.X.TLD`, which you point at this host's private
 address. Firewall that port to `trustedCIDR`.
 
 The MySQL root password lives in this host's `.env` and nowhere else — not in
-NocoDB, where every application's token could read it. The `apps` phase asks
-for it once.
+NocoDB, where every application's token could read it — and nothing else
+needs it.
 
 ### b) The application host — `./install.sh apps`
 
@@ -85,26 +101,25 @@ apps then reach MySQL by container name).
 
 1. Ensures `npm_network`, `platform-local`, `echo-local` and the data volumes.
 2. Clones `identity`, `AidaAdmin`, `AidaAgent`, `EchoWeb`, `EchoService` and
-   `EchoMedia` under `--dir` (default `/opt/local`), laid out the way the
+   `EchoMedia` under the install root (this checkout's parent, or `--dir`), laid out the way the
    compose files expect:
 
    ```
-   /opt/local/AidaPlatformDB      this repo (echo/ is included by the Echo environment)
-   /opt/local/identity
-   /opt/local/aida/AidaAdmin
-   /opt/local/aida/AidaAgent
-   /opt/local/echo                the Echo environment (from EchoWeb/deploy/environment)
+   /opt/AidaPlatformDB      this repo (echo/ is included by the Echo environment)
+   /opt/identity
+   /opt/aida/AidaAdmin
+   /opt/aida/AidaAgent
+   /opt/echo                the Echo environment (from EchoWeb/deploy/environment)
      ├── EchoWeb  EchoService  EchoMedia
      └── compose.yaml  web.host.yaml  service.host.yaml  deploy.sh  .env
    ```
 3. Writes each `.env` with `NOCODB_BASE_URL` and that application's token, and
    Echo's with the generated MySQL passwords its jobs create.
-4. Asks for the MySQL root password (from the database host's
-   `AidaPlatformDB/.env`; found automatically when MySQL runs on this host),
-   checks MySQL is reachable first, and creates the MySQL accounts
-   (`identity`, `aida_admin_app`; Echo's are created by its own jobs at
-   deploy). The root password is kept only in `echo/.env` for Echo's migration
-   job. Then it seeds the rows the applications need to
+4. Checks MySQL is reachable, then takes the account passwords the database
+   host left in the rows — no MySQL credential is asked for; Echo's `.env`
+   gets `echo_admin` for its jobs. (A database host set up before that step
+   existed is the fallback: the accounts are created from here with its root
+   password, asked for once.) Then it seeds the rows the applications need to
    start: database coordinates, the shared `IDENTITY_CLIENT_SECRET`, session
    and webhook secrets, the public URLs derived from `PARENT_DOMAIN`
    (`https://identity.X.TLD`, `https://aida-admin.X.TLD`,
