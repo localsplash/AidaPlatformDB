@@ -43,6 +43,13 @@ is created.
 
 ### a) The database host — `./install.sh database`
 
+The database host is any Linux host with Docker: a dedicated VM in production,
+or the same host as the applications on a small platform. Either way MySQL and
+NocoDB run as the two pinned containers in `compose.yaml`; there is no native
+(package) install, and the only prerequisites are the ones above. A dedicated VM
+differs in one flag, `--mysql-publish`, so the application hosts can reach MySQL
+as `lsdb.X.TLD`.
+
 1. Creates the external networks and volumes, writes `.env` (generated
    `MYSQL_ROOT_PASSWORD` and `NC_AUTH_JWT_SECRET`, `NOCODB_BASE_URL` =
    `https://nocodb.X.TLD`) and starts MySQL and NocoDB.
@@ -106,8 +113,17 @@ Its settings are the `officepulse` rows (see that repository's README).
 
 ## Day-to-day
 
-- Deploy the database layer with `docker compose up -d` in this folder; each
-  application with its own folder's `deploy.sh` or Compose file.
+- The database layer is `docker compose up -d` in this folder on the database
+  host, whether that host is a dedicated VM or shared with the applications.
+  Images are pinned by digest, so a recreate never upgrades MySQL or NocoDB by
+  accident; upgrading is a deliberate edit of the digest, then `up -d`.
+- The data is the two external volumes, `platform-mysql-data` and
+  `platform-nocodb-data`; `down -v` cannot remove them. A dump is
+  `docker exec platform-mysql-local mysqldump --all-databases --single-transaction --routines`
+  with the root password from `.env`.
+- Each application is deployed from its own folder: `deploy.sh` for the Echo
+  environment, `docker compose up -d --build` (or `docker-container-control
+  deploy <name>`) for the others.
 - Upgrading `echo_db` is a normal Echo deploy: the `echo-migrate` job applies
   new `echo/init/*.sql` files first ([echo/README.md](echo/README.md)).
 - Rotating a password: change the row (or Echo's `.env`) and re-run the
