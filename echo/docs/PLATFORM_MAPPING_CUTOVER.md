@@ -1,3 +1,13 @@
+# Superseded: historical platform mapping cutover
+
+The disposable Dev decision removes the old Echo auth/provenance tables and the
+mapping importer. This document describes the previous preservation plan and is
+historical only. Do not run its import steps against the current schema.
+Follow [the current retirement procedure](../README.md) and migration 013 instead.
+Identity tenant-number assignments are the runtime authority.
+
+---
+
 # Echo canonical identity mappings
 
 Migration 012 adds Echo-owned mappings while preserving every existing organization, person, membership, session and message row. Identity alone owns platform users, tenants, memberships and application browser sessions. There are no cross-database foreign keys or copies of Identity/vendor schemas.

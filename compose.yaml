@@ -1,0 +1,104 @@
+# AidaPlatformDB: the shared MySQL and NocoDB every application on a platform
+# uses. Deploy this file on the database host (install.sh database); the
+# applications may live on the same host or on others.
+#
+#   MySQL  (platform-mysql-local)  echo_db (Echo), platform_db (Identity),
+#          aida_admin_db (AidaAdmin) and aidacalls_db (OfficePulse runtime).
+#          Published on 127.0.0.1:3306 unless MYSQL_PUBLISH says otherwise;
+#          other hosts reach it as lsdb.X.TLD or through a tunnel.
+#   NocoDB (platform-nocodb-local) the PlatformConfig base whose cfg_tbl_Setting
+#          table is the settings store every app reads; public as
+#          NOCODB_BASE_URL (https://nocodb.X.TLD) through the reverse proxy.
+#
+# The data lives on the host, not in Docker: MySQL's data directory and
+# NocoDB's store are bind mounts under DATA_DIR (default /var/lib/aidaplatformdb),
+# where an operator can see, back up and restore them, and where no Compose
+# command can remove them. The networks are external because other stacks
+# share them. install.sh creates all of it; by hand:
+#   mkdir -p /var/lib/aidaplatformdb/mysql /var/lib/aidaplatformdb/nocodb
+#   docker network create --subnet 192.168.112.0/20 platform-local
+#   docker network create --internal --subnet 10.247.23.0/24 echo-local
+#
+# Images are pinned by digest so a recreate never upgrades either service by
+# accident. Databases, users and grants belong to the apps that use them (each
+# repo's scripts/db-users.sh; echo/ here); nothing in this file creates them.
+# Secrets and this host's names are in .env next to this file (mode 600).
+
+name: aidaplatformdb
+
+x-timezone: &timezone
+  - /etc/localtime:/etc/localtime:ro
+  - /etc/timezone:/etc/timezone:ro
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+services:
+  mysql:
+    image: mysql@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb # 8.4.11
+    container_name: platform-mysql-local
+    hostname: ${MYSQL_HOSTNAME:-platform-mysql}
+    environment:
+      TZ: ${TZ:-America/Los_Angeles}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set in .env}
+    volumes:
+      - type: bind
+        source: /var/lib/aidaplatformdb/mysql
+        target: /var/lib/mysql
+        bind:
+          create_host_path: false
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    ports:
+      # Loopback by default. A platform whose applications run on other hosts
+      # sets MYSQL_PUBLISH to a reachable address (e.g. 0.0.0.0:3306) and
+      # firewalls it to trustedCIDR.
+      - ${MYSQL_PUBLISH:-127.0.0.1:3306}:3306
+    networks:
+      - platform-local
+      - echo-local
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 -u root --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    logging: *logging
+    restart: unless-stopped
+
+  nocodb:
+    image: nocodb/nocodb@sha256:2aacc3c704d4f74b27e2a39ac838ac9019c0b008bbbfff673b541a3a75ee1579
+    container_name: platform-nocodb-local
+    hostname: ${NOCODB_HOSTNAME:-platform-nocodb}
+    environment:
+      TZ: ${TZ:-America/Los_Angeles}
+      # NocoDB builds absolute links (invites, shared views) from its public URL.
+      NC_PUBLIC_URL: ${NOCODB_BASE_URL:?the public URL of this NocoDB, https://nocodb.X.TLD}
+      NC_DISABLE_TELE: "true"
+      NC_AUTH_JWT_SECRET: ${NC_AUTH_JWT_SECRET:?set in .env}
+    volumes:
+      - type: bind
+        source: /var/lib/aidaplatformdb/nocodb
+        target: /usr/app/data
+        bind:
+          create_host_path: false
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    ports:
+      - 127.0.0.1:18087:8080
+    networks:
+      - platform-local
+      - echo-local
+      - npm_network # the reverse proxy routes nocodb.X.TLD here
+    logging: *logging
+    restart: unless-stopped
+
+networks:
+  platform-local:
+    external: true
+  echo-local:
+    external: true
+  npm_network:
+    external: true
