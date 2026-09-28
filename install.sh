@@ -444,6 +444,10 @@ phase_database() {
   [ -n "$MYSQL_PUBLISH" ] && env_set "$SELF_DIR/.env" MYSQL_PUBLISH "$MYSQL_PUBLISH"
   [ -n "$DATA_DIR" ] && env_set "$SELF_DIR/.env" DATA_DIR "$DATA_DIR"
 
+  local unmigrated; unmigrated=$(unmigrated_volumes "$data_dir")
+  if [ -n "$unmigrated" ]; then
+    die "the data is still in the Docker volume(s) $unmigrated while $data_dir is empty: starting now would bring up a fresh, empty instance beside it. Run './install.sh migrate-data' first, then re-run."
+  fi
   log "Starting MySQL and NocoDB"
   run docker compose --project-directory "$SELF_DIR" up -d
   wait_for "MySQL" 180 sh -c '[ "$(docker inspect -f "{{.State.Health.Status}}" platform-mysql-local)" = healthy ]'
@@ -491,6 +495,41 @@ phase_database() {
 
 # ── migrate-data: named volumes → DATA_DIR ───────────────────────────────────
 
+# unmigrated_volumes DATA_DIR: the named volumes an older checkout used that
+# still hold data while the host directory compose.yaml now mounts is empty.
+# Starting on that empty directory would bring up a fresh, empty MySQL or
+# NocoDB beside the real data — the one thing this installer must never do.
+unmigrated_volumes() {
+  local data_dir=$1 found=""
+  local volumes=(platform-mysql-data platform-nocodb-data) dirs=("$data_dir/mysql" "$data_dir/nocodb") i
+  for i in 0 1; do
+    docker volume inspect "${volumes[$i]}" >/dev/null 2>&1 || continue
+    [ -d "${dirs[$i]}" ] && [ -n "$(ls -A "${dirs[$i]}" 2>/dev/null)" ] && continue
+    found+="${volumes[$i]} "
+  done
+  printf '%s' "$found"
+}
+
+# fresh_instance DIR KIND: true when DIR holds a MySQL/NocoDB instance that was
+# initialised empty (no application database; no PlatformConfig base) — what a
+# start on an empty directory leaves behind, and safe to set aside.
+fresh_instance() {
+  local dir=$1 kind=$2
+  case $kind in
+    mysql) [ -d "$dir/mysql" ] && [ ! -d "$dir/platform_db" ] && [ ! -d "$dir/echo_db" ] && [ ! -d "$dir/aida_admin_db" ] && [ ! -d "$dir/aidacalls_db" ] ;;
+    nocodb) [ -f "$dir/noco.db" ] && have python3 && [ "$(python3 - "$dir/noco.db" <<'PY'
+import sqlite3, sys
+try:
+    c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+    print(c.execute("select count(*) from nc_bases_v2 where deleted = 0 and title = 'PlatformConfig'").fetchone()[0])
+except Exception:
+    print("?")
+PY
+)" = 0 ] ;;
+    *) return 1 ;;
+  esac
+}
+
 # copy_volume_to_dir VOLUME DIR: everything in the volume, ownership and modes
 # preserved, into a directory that must be empty.
 copy_volume_to_dir() {
@@ -506,13 +545,18 @@ phase_migrate_data() {
   prereqs docker
   [ -n "$DATA_DIR" ] && env_set "$SELF_DIR/.env" DATA_DIR "$DATA_DIR"
 
-  local volumes=(platform-mysql-data platform-nocodb-data) dirs=("$data_dir/mysql" "$data_dir/nocodb") todo=() i
+  local volumes=(platform-mysql-data platform-nocodb-data) dirs=("$data_dir/mysql" "$data_dir/nocodb") kinds=(mysql nocodb) todo=() aside=() i
   for i in 0 1; do
     if ! docker volume inspect "${volumes[$i]}" >/dev/null 2>&1; then
       note "no volume ${volumes[$i]}: ${dirs[$i]} is already the data"; continue
     fi
     if [ -d "${dirs[$i]}" ] && [ -n "$(ls -A "${dirs[$i]}" 2>/dev/null)" ]; then
-      die "${dirs[$i]} is not empty and volume ${volumes[$i]} still exists. Decide which one is current, remove the other, and re-run."
+      if fresh_instance "${dirs[$i]}" "${kinds[$i]}"; then
+        note "${dirs[$i]} holds a fresh, empty ${kinds[$i]} (started on the empty directory); it will be set aside and the volume's data used"
+        aside+=("$i")
+      else
+        die "${dirs[$i]} is not empty, holds real data, and volume ${volumes[$i]} still exists. Decide which one is current, remove the other, and re-run."
+      fi
     fi
     todo+=("$i")
   done
@@ -520,6 +564,11 @@ phase_migrate_data() {
 
   log "Stopping MySQL and NocoDB while their data is copied"
   run docker compose --project-directory "$SELF_DIR" stop
+  local stamp; stamp=$(date +%Y%m%d%H%M%S)
+  for i in "${aside[@]}"; do
+    note "${dirs[$i]} -> ${dirs[$i]}.empty-$stamp (delete it once satisfied)"
+    run mv "${dirs[$i]}" "${dirs[$i]}.empty-$stamp"
+  done
   for i in "${todo[@]}"; do
     note "${volumes[$i]} -> ${dirs[$i]}"
     copy_volume_to_dir "${volumes[$i]}" "${dirs[$i]}"
