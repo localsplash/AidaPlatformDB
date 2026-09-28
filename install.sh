@@ -6,6 +6,8 @@
 #   ./install.sh apps         Identity, AidaAdmin, AidaAgent and the Echo environment
 #   ./install.sh officepulse  OfficePulseAidaIntegration on the PBX host
 #   ./install.sh all          database, then apps, on one host
+#   ./install.sh migrate-data move MySQL's and NocoDB's data from the Docker
+#                             volumes an older checkout used onto the host
 #
 # Run it from a checkout, or straight from GitHub on a fresh host:
 #
@@ -58,7 +60,7 @@ ECHO_NETWORK=echo-local
 ECHO_SUBNET=10.247.23.0/24
 
 usage() {
-  sed -n '3,18p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '3,20p' "$SELF" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 Options
@@ -388,6 +390,64 @@ phase_database() {
   return 0
 }
 
+# ── migrate-data: named volumes → DATA_DIR ───────────────────────────────────
+
+# copy_volume_to_dir VOLUME DIR: everything in the volume, ownership and modes
+# preserved, into a directory that must be empty.
+copy_volume_to_dir() {
+  local volume=$1 dir=$2
+  ensure_dir "$dir"
+  run docker run --rm -v "$volume:/src:ro" -v "$dir:/dst" alpine sh -c 'cp -a /src/. /dst/'
+}
+
+phase_migrate_data() {
+  local data_dir=${DATA_DIR:-$(env_get "$SELF_DIR/.env" DATA_DIR)}
+  data_dir=${data_dir:-/var/lib/aidaplatformdb}
+  log "Move MySQL's and NocoDB's data from Docker volumes to $data_dir"
+  prereqs docker
+  [ -n "$DATA_DIR" ] && env_set "$SELF_DIR/.env" DATA_DIR "$DATA_DIR"
+
+  local volumes=(platform-mysql-data platform-nocodb-data) dirs=("$data_dir/mysql" "$data_dir/nocodb") todo=() i
+  for i in 0 1; do
+    if ! docker volume inspect "${volumes[$i]}" >/dev/null 2>&1; then
+      note "no volume ${volumes[$i]}: ${dirs[$i]} is already the data"; continue
+    fi
+    if [ -d "${dirs[$i]}" ] && [ -n "$(ls -A "${dirs[$i]}" 2>/dev/null)" ]; then
+      die "${dirs[$i]} is not empty and volume ${volumes[$i]} still exists. Decide which one is current, remove the other, and re-run."
+    fi
+    todo+=("$i")
+  done
+  if [ "${#todo[@]}" -eq 0 ]; then log "Nothing to migrate"; return 0; fi
+
+  log "Stopping MySQL and NocoDB while their data is copied"
+  run docker compose --project-directory "$SELF_DIR" stop
+  for i in "${todo[@]}"; do
+    note "${volumes[$i]} -> ${dirs[$i]}"
+    copy_volume_to_dir "${volumes[$i]}" "${dirs[$i]}"
+  done
+  # MySQL's data directory must not be world-writable; the volume's root was.
+  if [ -d "$data_dir/mysql" ] || (( DRY )); then run chmod 750 "$data_dir/mysql"; fi
+
+  log "Starting on the host directories"
+  run docker compose --project-directory "$SELF_DIR" up -d
+  wait_for "MySQL" 180 sh -c '[ "$(docker inspect -f "{{.State.Health.Status}}" platform-mysql-local)" = healthy ]'
+  wait_for "NocoDB" 180 curl -fsS -o /dev/null http://127.0.0.1:18087/
+  if ! (( DRY )); then
+    note "databases now served from $data_dir/mysql:"
+    docker exec -e MYSQL_PWD="$(env_get "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD)" platform-mysql-local \
+      mysql -uroot -N -e "SELECT CONCAT('  ', table_schema, ': ', COUNT(*), ' tables') FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys') GROUP BY table_schema"
+    note "NocoDB store: $(du -sh "$data_dir/nocodb/noco.db" 2>/dev/null | cut -f1) noco.db"
+  fi
+
+  log "The old volumes are now copies"
+  local answer=y
+  if ! (( YES )) && { : < /dev/tty; } 2>/dev/null; then
+    read -r -p "Remove volumes ${volumes[*]}? [Y/n] " answer < /dev/tty
+  fi
+  case ${answer:-y} in n|N|no|NO) note "kept; remove them with docker volume rm when satisfied" ;;
+    *) for i in "${todo[@]}"; do run docker volume rm "${volumes[$i]}"; done ;; esac
+}
+
 # ── Phase b: the application host ────────────────────────────────────────────
 
 phase_apps() {
@@ -573,7 +633,7 @@ ARGS=("$@")
 PHASE=""
 while [ $# -gt 0 ]; do
   case $1 in
-    database|apps|officepulse|all) PHASE=$1 ;;
+    database|apps|officepulse|all|migrate-data) PHASE=$1 ;;
     --branch) BRANCH=$2; shift ;;
     --dir) DIR=$(readlink -f "$2"); shift ;;
     --parent-domain) PARENT_DOMAIN=$2; shift ;;
@@ -618,4 +678,5 @@ case $PHASE in
   apps) phase_apps ;;
   officepulse) phase_officepulse ;;
   all) phase_database; phase_apps ;;
+  migrate-data) phase_migrate_data ;;
 esac
