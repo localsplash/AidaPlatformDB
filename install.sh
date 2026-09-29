@@ -408,7 +408,7 @@ repo_script() {
     branch=$(repo_branch "$repo")
     if (( DRY )); then note "would fetch $repo@$branch for scripts/$script"; src=/nonexistent; else
       tmp=$(mktemp -d); git clone -q --depth 1 -b "$branch" "$GIT_BASE/$repo.git" "$tmp/$repo"; src="$tmp/$repo"
-      [ -f "$src/scripts/$script" ] || die "$repo@$branch has no scripts/$script; that branch predates it (it is on dev)"
+      [ -f "$src/scripts/$script" ] || die "$repo@$branch has no scripts/$script: that branch predates the platform layout. Promote $repo's dev branch to $branch (merge it), or run with --branch dev."
     fi
   fi
   note "$repo/scripts/$script"
@@ -731,13 +731,18 @@ phase_apps() {
   fi
   [ "$SELF_DIR" = "$DIR/AidaPlatformDB" ] || clone_or_update AidaPlatformDB "$DIR/AidaPlatformDB"
   clone_or_update identity "$DIR/identity"
+  # identity's platform layout (compose.yaml, scripts/db-users.sh) exists only
+  # from a certain point; an older branch would bring up its bundled MySQL.
+  for f in compose.yaml scripts/db-users.sh; do
+    [ -f "$DIR/identity/$f" ] || (( DRY )) || die "identity@$(git -C "$DIR/identity" branch --show-current) has no $f: that branch predates the platform layout. Promote identity's dev branch (merge it into the default branch), or run with --branch dev."
+  done
   clone_or_update AidaAdmin "$DIR/aida/AidaAdmin"
   clone_or_update AidaAgent "$DIR/aida/AidaAgent"
   clone_or_update EchoWeb "$DIR/echo/EchoWeb"
   clone_or_update EchoService "$DIR/echo/EchoService"
   clone_or_update EchoMedia "$DIR/echo/EchoMedia"
   local f
-  [ -f "$DIR/echo/EchoWeb/deploy/environment/compose.yaml" ] || die "EchoWeb@$BRANCH has no deploy/environment (the Echo environment template): use a branch that has it, e.g. --branch dev"
+  [ -f "$DIR/echo/EchoWeb/deploy/environment/compose.yaml" ] || (( DRY )) || die "EchoWeb@$(git -C "$DIR/echo/EchoWeb" branch --show-current) has no deploy/environment (the Echo environment template): that branch predates it; use one that has it"
   for f in compose.yaml web.host.yaml service.host.yaml deploy.sh; do
     if [ ! -e "$DIR/echo/$f" ]; then
       note "echo/$f from EchoWeb/deploy/environment"
@@ -766,10 +771,19 @@ phase_apps() {
   web_pw=$(row_get echo-web DB_PASSWORD); service_pw=$(row_get echo-service DB_PASSWORD)
   env_set "$echo_env" ECHO_WEB_DB_PASSWORD "${web_pw:-$(secret)}"
   env_set "$echo_env" ECHO_SERVICE_DB_PASSWORD "${service_pw:-$(secret)}"
-  env_set "$echo_env" ECHO_WEB_TAG '${ENVIRONMENT_NAME}-${ECHO_WEB_SHORT:-${BUILD_REVISION_SHORT-local}}'
-  env_set "$echo_env" ECHO_SERVICE_TAG '${ENVIRONMENT_NAME}-${ECHO_SERVICE_SHORT:-${BUILD_REVISION_SHORT-local}}'
-  env_set "$echo_env" ECHO_MEDIA_TAG '${ENVIRONMENT_NAME}-${ECHO_MEDIA_SHORT:-${BUILD_REVISION_SHORT-local}}'
-  env_set "$echo_env" ENVIRONMENT_NAME "$ENVIRONMENT_NAME"
+  # Image tags: <environment>-<commit>. The environment name is written
+  # literally — Compose resolves a .env reference only to variables defined
+  # above it in the file, and the applications read ENVIRONMENT_NAME from
+  # PlatformConfig, not from here. The *_SHORT stamps come from deploy.sh.
+  env_set "$echo_env" ECHO_WEB_TAG "$ENVIRONMENT_NAME"'-${ECHO_WEB_SHORT:-${BUILD_REVISION_SHORT-local}}'
+  env_set "$echo_env" ECHO_SERVICE_TAG "$ENVIRONMENT_NAME"'-${ECHO_SERVICE_SHORT:-${BUILD_REVISION_SHORT-local}}'
+  env_set "$echo_env" ECHO_MEDIA_TAG "$ENVIRONMENT_NAME"'-${ECHO_MEDIA_SHORT:-${BUILD_REVISION_SHORT-local}}'
+  # An earlier installer wrote the tags as ${ENVIRONMENT_NAME}-... with the
+  # variable defined below them, which Compose resolved to "-<commit>".
+  if [ -f "$echo_env" ] && grep -q '^ECHO_[A-Z]*_TAG=\${ENVIRONMENT_NAME}-' "$echo_env"; then
+    note "$echo_env: rewriting the image tags to $ENVIRONMENT_NAME-<commit> (Compose could not resolve \${ENVIRONMENT_NAME} there)"
+    run sed -i "s/^\(ECHO_[A-Z]*_TAG=\)\${ENVIRONMENT_NAME}-/\1$ENVIRONMENT_NAME-/; /^ENVIRONMENT_NAME=/d" "$echo_env"
+  fi
 
   log "PlatformConfig rows"
   # One shared secret for redeeming Identity handoff codes; Identity mints it if absent.
@@ -820,12 +834,10 @@ phase_apps() {
 
   if ! (( accounts_done )); then
     log "MySQL accounts on $DB_HOST (fallback: created from here with root)"
-    run docker run --rm --network "$PLATFORM_NETWORK" -v "$DIR/identity/scripts:/scripts:ro" \
-      -e DB_HOST="$DB_HOST" -e DB_PASSWORD="$identity_db_password" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD" \
-      mysql:8.4 bash /scripts/db-users.sh
-    run docker run --rm --network "$PLATFORM_NETWORK" -v "$DIR/aida/AidaAdmin/scripts:/scripts:ro" \
-      -e AIDA_ADMIN_DATABASE_URL="$aida_admin_url" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD" \
-      mysql:8.4 bash /scripts/db-users.sh
+    repo_script identity "$DIR/identity" db-users.sh \
+      -e DB_HOST="$DB_HOST" -e DB_PASSWORD="$identity_db_password" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD"
+    repo_script AidaAdmin "$DIR/aida/AidaAdmin" db-users.sh \
+      -e AIDA_ADMIN_DATABASE_URL="$aida_admin_url" -e DB_HOST="$DB_HOST" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD"
     note "echo_web and echo_service are created by the Echo environment's own jobs at deploy"
   fi
 
