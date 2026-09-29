@@ -1,0 +1,20 @@
+name: Installer rerun workspace
+on:
+  push:
+    branches: [work/installer-rerun-20260929]
+    paths: [.github/workflows/installer-rerun-workspace.yml]
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package reviewed sources
+        run: |
+          git archive HEAD -o "$RUNNER_TEMP/installer-source.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-source
+          path: ${{ runner.temp }}/installer-source.tar
+          retention-days: 1
