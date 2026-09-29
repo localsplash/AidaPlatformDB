@@ -408,7 +408,7 @@ repo_script() {
     branch=$(repo_branch "$repo")
     if (( DRY )); then note "would fetch $repo@$branch for scripts/$script"; src=/nonexistent; else
       tmp=$(mktemp -d); git clone -q --depth 1 -b "$branch" "$GIT_BASE/$repo.git" "$tmp/$repo"; src="$tmp/$repo"
-      [ -f "$src/scripts/$script" ] || die "$repo@$branch has no scripts/$script; that branch predates it (it is on dev)"
+      [ -f "$src/scripts/$script" ] || die "$repo@$branch has no scripts/$script: that branch predates the platform layout. Promote $repo's dev branch to $branch (merge it), or run with --branch dev."
     fi
   fi
   note "$repo/scripts/$script"
@@ -731,6 +731,11 @@ phase_apps() {
   fi
   [ "$SELF_DIR" = "$DIR/AidaPlatformDB" ] || clone_or_update AidaPlatformDB "$DIR/AidaPlatformDB"
   clone_or_update identity "$DIR/identity"
+  # identity's platform layout (compose.yaml, scripts/db-users.sh) exists only
+  # from a certain point; an older branch would bring up its bundled MySQL.
+  for f in compose.yaml scripts/db-users.sh; do
+    [ -f "$DIR/identity/$f" ] || (( DRY )) || die "identity@$(git -C "$DIR/identity" branch --show-current) has no $f: that branch predates the platform layout. Promote identity's dev branch (merge it into the default branch), or run with --branch dev."
+  done
   clone_or_update AidaAdmin "$DIR/aida/AidaAdmin"
   clone_or_update AidaAgent "$DIR/aida/AidaAgent"
   clone_or_update EchoWeb "$DIR/echo/EchoWeb"
@@ -820,12 +825,10 @@ phase_apps() {
 
   if ! (( accounts_done )); then
     log "MySQL accounts on $DB_HOST (fallback: created from here with root)"
-    run docker run --rm --network "$PLATFORM_NETWORK" -v "$DIR/identity/scripts:/scripts:ro" \
-      -e DB_HOST="$DB_HOST" -e DB_PASSWORD="$identity_db_password" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD" \
-      mysql:8.4 bash /scripts/db-users.sh
-    run docker run --rm --network "$PLATFORM_NETWORK" -v "$DIR/aida/AidaAdmin/scripts:/scripts:ro" \
-      -e AIDA_ADMIN_DATABASE_URL="$aida_admin_url" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD" \
-      mysql:8.4 bash /scripts/db-users.sh
+    repo_script identity "$DIR/identity" db-users.sh \
+      -e DB_HOST="$DB_HOST" -e DB_PASSWORD="$identity_db_password" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD"
+    repo_script AidaAdmin "$DIR/aida/AidaAdmin" db-users.sh \
+      -e AIDA_ADMIN_DATABASE_URL="$aida_admin_url" -e DB_HOST="$DB_HOST" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD"
     note "echo_web and echo_service are created by the Echo environment's own jobs at deploy"
   fi
 
