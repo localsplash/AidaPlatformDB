@@ -173,6 +173,66 @@ Its settings are the `officepulse` rows (see that repository's README).
   owning `db-users.sh`; they converge.
 
 
+
+## Re-running the installer
+
+Run the same phase from the same checkout/install root. Existing settings are
+reviewed rather than requested from scratch:
+
+```sh
+./install.sh apps --branch dev
+./install.sh database --branch dev
+# On the PBX host:
+./install.sh officepulse --branch dev
+```
+
+Normal prompts show the current value in brackets. Press **Enter** to keep it,
+or type a replacement. Password/token prompts show only
+`[configured; Enter to keep, or type a replacement; not echoed]`.
+Neither the old secret nor the replacement is printed. Explicit flags and
+nonempty environment variables take precedence without an extra prompt.
+`--yes` uses saved values/defaults; an essential value with neither still fails.
+
+The installer discovers the existing application `.env` files under `--dir`,
+the platform `.env`, and OfficePulse's `/etc/aida-integration/env`. It reads these
+as data, never executes them. When the saved NocoDB endpoint is reachable,
+PlatformConfig supplies the current parent domain and environment name before
+prompting. Otherwise local hints are used, then reconciled against the real rows
+after NocoDB is available. The database phase stores its validated installer
+token as `NOCODB_INSTALLER_TOKEN` in the platform `.env`, not in PlatformConfig.
+`INSTALL_PARENT_DOMAIN` and `INSTALL_ENVIRONMENT_NAME` are offline hints only;
+the existing platform rows remain authoritative for defaults.
+
+Selected bootstrap replacements (such as an application API token or the public
+NocoDB URL) are actually written, rather than silently ignored because a file
+already exists. Changed files are replaced atomically with mode 600; unrelated
+entries and comments remain. Keeping a shared URL also keeps any existing
+per-application URL overrides. These bootstrap inputs are single-line values.
+
+Saved `DATA_DIR` and `MYSQL_PUBLISH` are reused and displayed on database-host
+reruns. Selecting a different data directory while the old one contains data
+fails before writing settings or starting containers; it is not a data migration.
+MySQL root/JWT secrets and existing application database credentials are kept,
+not rotated by this review. Scoped `DB_*` rows are displayed (passwords hidden)
+and preserved; `--db-host` supplies missing database coordinates, not a mass
+rewrite of already-provisioned per-app connections. Credential rotation, database
+moves, and a platform domain migration require their own coordinated changes.
+
+`--dry-run` masks complete secret values (including spaces/newlines), makes no
+settings writes, and skips the checkout's auto-update. `--no-deploy` still permits
+settings/account setup but stops before the application builds/restarts, as before.
+Neither option turns the database phase into an offline operation: that phase
+normally starts MySQL/NocoDB so it can perform setup; use `--dry-run` to preview it.
+
+Regression tests include real terminal prompts and reruns against temporary files
+and a fake settings API; no running deployment is used:
+
+```sh
+bash -n install.sh
+python3 -m unittest discover -s tests -v
+```
+
+
 ## Aida database settings
 
 Database and app setup now seeds the same canonical setting keys in each
