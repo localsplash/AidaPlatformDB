@@ -1206,9 +1206,16 @@ phase_apps() {
     provision_aida_databases "$DB_HOST" "$MYSQL_ADMIN_PASSWORD"
   fi
 
-  if (( NO_DEPLOY )); then log "--no-deploy: stopping before build and start"; else
+  if (( NO_DEPLOY )); then log "--no-deploy: stopping before build and start (AidaAdmin's NocoDB tables are created at deploy)"; else
     log "Building and starting"
     compose_up "$DIR/identity"
+    # AidaAdmin owns four tables in the PlatformConfig base (aida_tbl_*); its
+    # runtime never creates them. Its own bootstrap CLI, run from the image
+    # with the .env token, creates what is missing and adds missing columns —
+    # additive, so safe on every run — before the application starts.
+    log "AidaAdmin's NocoDB tables (nocodb upgrade, from its image)"
+    export_stamp "$DIR/aida/AidaAdmin"
+    run docker compose --project-directory "$DIR/aida/AidaAdmin" run --rm --no-deps aida-admin node server/dist/nocodb/cli.js upgrade
     compose_up "$DIR/aida/AidaAdmin"
     compose_up "$DIR/aida/AidaAgent"
     run "$DIR/echo/deploy.sh"

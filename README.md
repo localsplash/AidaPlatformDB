@@ -127,7 +127,11 @@ apps then reach MySQL by container name).
    and webhook secrets, the public URLs derived from `PARENT_DOMAIN`
    (`https://identity.X.TLD`, `https://aida-admin.X.TLD`,
    `https://officepulse-api.X.TLD`) and the voice model defaults.
-5. Builds and starts everything, then prints the reverse-proxy hosts to create
+5. Builds and starts everything — including AidaAdmin's four NocoDB tables
+   (`aida_tbl_TenantProfile`, `aida_tbl_AssistantProfile`,
+   `aida_tbl_ProfileAssignment`, `aida_tbl_Appearance`), created with its own
+   `nocodb upgrade` from its image before it starts; the step is additive, so
+   re-running is safe — then prints the reverse-proxy hosts to create
    and what is still yours to fill in: Identity's OAuth provider credentials
    (`/setup` in a browser claims the instance), the `aida/LIVEKIT_*` rows, and
    carrier credentials.
