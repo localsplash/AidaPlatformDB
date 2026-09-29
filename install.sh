@@ -96,6 +96,8 @@ secret() { openssl rand -hex 32; }
 # ask VAR --flag "prompt" [default]: keeps a value already given, otherwise
 # prompts on the terminal (or takes the default under --yes / without one).
 # Prompts read /dev/tty, so `curl | bash` — whose stdin is the script — works.
+# A password, secret or token is typed without echo: it must not end up in
+# the terminal's scrollback or in a pasted transcript.
 ask() {
   local var=$1 flag=$2 prompt=$3 default=${4:-} value
   [ -n "${!var}" ] && return 0
@@ -103,7 +105,11 @@ ask() {
     [ -n "$default" ] && { printf -v "$var" '%s' "$default"; return 0; }
     die "$prompt: give it with $flag"
   fi
-  read -r -p "$prompt${default:+ [$default]}: " value < /dev/tty
+  if [[ $var =~ (PASSWORD|SECRET|TOKEN) ]]; then
+    read -rs -p "$prompt (not echoed): " value < /dev/tty; echo > /dev/tty
+  else
+    read -r -p "$prompt${default:+ [$default]}: " value < /dev/tty
+  fi
   printf -v "$var" '%s' "${value:-$default}"
   [ -n "${!var}" ] || die "$prompt is required"
 }
@@ -196,17 +202,28 @@ env_get() { # FILE KEY -> value, or nothing; never fails (set -e would end the s
 
 # ── Git ──────────────────────────────────────────────────────────────────────
 
+# repo_branch REPO: --branch when the repository has it, else its default
+# branch (a repository whose work has all been promoted may no longer have a
+# dev branch, and one that has not been promoted may only have it).
+repo_branch() {
+  local repo=$1
+  if git ls-remote --exit-code --heads "$GIT_BASE/$repo.git" "$BRANCH" >/dev/null 2>&1; then printf '%s' "$BRANCH"; return; fi
+  local head; head=$(git ls-remote --symref "$GIT_BASE/$repo.git" HEAD 2>/dev/null | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/", "", $2); print $2; exit}')
+  note "$repo has no branch $BRANCH: using its default, ${head:-main}" >&2
+  printf '%s' "${head:-main}"
+}
+
 clone_or_update() { # REPO DEST
-  local repo=$1 dest=$2
+  local repo=$1 dest=$2 branch; branch=$(repo_branch "$repo")
   if [ -d "$dest/.git" ]; then
-    note "$dest: pulling $BRANCH"
+    note "$dest: pulling $branch"
     run git -C "$dest" fetch --prune -q origin
-    run git -C "$dest" checkout -q "$BRANCH"
+    run git -C "$dest" checkout -q "$branch"
     run git -C "$dest" pull -q --ff-only
   else
-    note "$dest: cloning $repo@$BRANCH"
+    note "$dest: cloning $repo@$branch"
     run mkdir -p "$(dirname "$dest")"
-    run git clone -q -b "$BRANCH" "$GIT_BASE/$repo.git" "$dest"
+    run git clone -q -b "$branch" "$GIT_BASE/$repo.git" "$dest"
   fi
 }
 
@@ -311,6 +328,15 @@ row_ensure() {
   (( DRY )) || rows_load
 }
 
+# row_set APP KEY VALUE: changes an existing row's value (creates it if absent).
+row_set() {
+  local id; id=$(jq -r --arg a "$1" --arg k "$2" '[.[] | select(.app==$a and .settingKey==$k)] | .[0].Id // ""' <<<"$ROWS_JSON")
+  if [ -z "$id" ]; then row_ensure "$1" "$2" "$3" false ""; return; fi
+  note "row $1/$2 updated: $3"
+  (( DRY )) || nc "/api/v2/tables/$TABLE_ID/records" -X PATCH --data "$(jq -n --argjson id "$id" --arg v "$3" '[{Id:$id, settingValue:$v}]')" >/dev/null
+  (( DRY )) || rows_load
+}
+
 # row_default APP KEY DEFAULT SECRET DESCRIPTION: the effective value ends up
 # in ROW_VALUE (not echoed: a command substitution would run this in a subshell
 # and the parent would never see the row it created).
@@ -320,6 +346,32 @@ row_default() {
   if [ -n "$ROW_VALUE" ]; then note "row $1/$2 kept"; return; fi
   row_ensure "$@"
   ROW_VALUE=$3
+}
+
+# IPv4 CIDR arithmetic for merging trustedCIDR: an entry already inside an
+# existing one is not added again (10.247.23.0/24 is inside 10.0.0.0/8).
+ip2int() { local a b c d; IFS=. read -r a b c d <<<"$1"; echo $(( (a << 24) | (b << 16) | (c << 8) | d )); }
+cidr_contains() { # OUTER INNER
+  local outer=$1 inner=$2 oplen iplen mask
+  [[ $outer == */* ]] && oplen=${outer#*/} || oplen=32; outer=${outer%/*}
+  [[ $inner == */* ]] && iplen=${inner#*/} || iplen=32; inner=${inner%/*}
+  (( iplen >= oplen )) || return 1
+  mask=$(( oplen == 0 ? 0 : (0xFFFFFFFF << (32 - oplen)) & 0xFFFFFFFF ))
+  (( ($(ip2int "$outer") & mask) == ($(ip2int "$inner") & mask) ))
+}
+cidr_union() { # CURRENT-LIST ADD-LIST -> CURRENT plus the entries it does not already cover
+  local out=$1 entry existing covered cur adds
+  IFS=, read -ra adds <<<"$2"
+  for entry in "${adds[@]}"; do
+    entry=${entry// /}; [ -n "$entry" ] || continue; covered=0
+    IFS=, read -ra cur <<<"$out"
+    for existing in "${cur[@]}"; do
+      existing=${existing// /}; [ -n "$existing" ] || continue
+      if cidr_contains "$existing" "$entry"; then covered=1; break; fi
+    done
+    (( covered )) || out="${out:+$out,}$entry"
+  done
+  printf '%s' "$out"
 }
 
 default_trusted_cidr() {
@@ -351,10 +403,12 @@ compose_up() { # DIR
 # shallow clone at --branch) in a throwaway MySQL client on the platform network.
 repo_script() {
   local repo=$1 local_dir=$2 script=$3; shift 3
-  local src=$local_dir tmp=""
+  local src=$local_dir tmp="" branch
   if [ ! -f "$src/scripts/$script" ]; then
-    if (( DRY )); then note "would fetch $repo@$BRANCH for scripts/$script"; src=/nonexistent; else
-      tmp=$(mktemp -d); git clone -q --depth 1 -b "$BRANCH" "$GIT_BASE/$repo.git" "$tmp/$repo"; src="$tmp/$repo"
+    branch=$(repo_branch "$repo")
+    if (( DRY )); then note "would fetch $repo@$branch for scripts/$script"; src=/nonexistent; else
+      tmp=$(mktemp -d); git clone -q --depth 1 -b "$branch" "$GIT_BASE/$repo.git" "$tmp/$repo"; src="$tmp/$repo"
+      [ -f "$src/scripts/$script" ] || die "$repo@$branch has no scripts/$script; that branch predates it (it is on dev)"
     fi
   fi
   note "$repo/scripts/$script"
@@ -615,9 +669,22 @@ phase_apps() {
   ensure_platformconfig
   row_ensure '*' PARENT_DOMAIN "$PARENT_DOMAIN" false "Apex domain (X.TLD) every application lives under; apps derive https://<app>.<PARENT_DOMAIN> from it."
   row_ensure '*' ENVIRONMENT_NAME "$ENVIRONMENT_NAME" false "dev, staging or prod; shown by the applications so nobody mistakes one environment for another."
-  local current_cidr; current_cidr=$(row_get '*' trustedCIDR)
-  ask TRUSTED_CIDR --trusted-cidr "trustedCIDR: the networks the platform's servers sit on" "${current_cidr:-$(default_trusted_cidr)}"
-  row_ensure '*' trustedCIDR "$TRUSTED_CIDR" false "IPv4 CIDRs (comma-separated) the platform's servers sit on. One value for the whole platform: every application admits server-to-server callers by it."
+  # trustedCIDR is platform-wide; the database host wrote its own networks, and
+  # this host's (its Docker subnets and its address, as the other hosts see
+  # its calls) must be in it too, or nothing here can call anything.
+  local current_cidr proposed_cidr; current_cidr=$(row_get '*' trustedCIDR)
+  proposed_cidr=$(cidr_union "$current_cidr" "$(default_trusted_cidr)")
+  if [ -n "$current_cidr" ] && [ "$proposed_cidr" != "$current_cidr" ]; then
+    note "trustedCIDR ($current_cidr) does not cover this host; proposing to add its networks"
+  fi
+  ask TRUSTED_CIDR --trusted-cidr "trustedCIDR: the networks the platform's servers sit on" "$proposed_cidr"
+  if [ -z "$current_cidr" ]; then
+    row_ensure '*' trustedCIDR "$TRUSTED_CIDR" false "IPv4 CIDRs (comma-separated) the platform's servers sit on. One value for the whole platform: every application admits server-to-server callers by it."
+  elif [ "$TRUSTED_CIDR" != "$current_cidr" ]; then
+    row_set '*' trustedCIDR "$TRUSTED_CIDR"
+  else
+    note "row */trustedCIDR kept"
+  fi
 
   # MySQL: the container from `install.sh database` when it is on this host,
   # otherwise the name the rows (or the platform convention) give it.
@@ -849,7 +916,29 @@ case $ENVIRONMENT_NAME in ""|dev|staging|prod) ;; *) die "--environment-name mus
 # and the branch is the checkout's own, so a dev checkout installs dev apps.
 if [ -f "$SELF_DIR/compose.yaml" ] && [ -d "$SELF_DIR/echo" ]; then
   (( DIR_GIVEN )) || DIR=$(dirname "$SELF_DIR")
-  [ -n "$BRANCH" ] || BRANCH=$(git -C "$SELF_DIR" branch --show-current 2>/dev/null || true)
+  g=(git -c safe.directory='*' -C "$SELF_DIR")
+  current=$("${g[@]}" branch --show-current 2>/dev/null || true)
+  # Always the current installer: a checkout behind its branch is brought up
+  # to date and re-run, so an old install.sh cannot install the wrong thing;
+  # one whose branch no longer exists at origin (promoted and deleted) moves
+  # to origin's default branch first.
+  if [ "${INSTALL_UPDATED:-}" != 1 ] && [ -n "$current" ] && "${g[@]}" fetch -q --prune origin 2>/dev/null; then
+    if ! "${g[@]}" show-ref -q --verify "refs/remotes/origin/$current"; then
+      default=$("${g[@]}" ls-remote --symref origin HEAD 2>/dev/null | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/", "", $2); print $2; exit}')
+      [ -n "$default" ] || die "branch $current no longer exists at origin and its default branch could not be read; check out the right branch in $SELF_DIR and re-run"
+      log "Branch $current no longer exists at origin: switching this checkout to $default and starting over"
+      "${g[@]}" checkout -q "$default" 2>/dev/null || "${g[@]}" checkout -q -b "$default" "origin/$default"
+      "${g[@]}" pull -q --ff-only || die "git pull --ff-only failed in $SELF_DIR: update it by hand and re-run"
+      INSTALL_UPDATED=1 exec "$SELF_DIR/install.sh" "${ARGS[@]}"
+    fi
+    behind=$("${g[@]}" rev-list --count "HEAD..origin/$current" 2>/dev/null || echo 0)
+    if [ "${behind:-0}" -gt 0 ]; then
+      log "This checkout is $behind commit(s) behind origin/$current: updating it and starting over"
+      "${g[@]}" pull -q --ff-only || die "git pull --ff-only failed in $SELF_DIR: update it by hand and re-run"
+      INSTALL_UPDATED=1 exec "$SELF_DIR/install.sh" "${ARGS[@]}"
+    fi
+  fi
+  [ -n "$BRANCH" ] || BRANCH=$current
 fi
 BRANCH=${BRANCH:-main}
 
