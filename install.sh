@@ -742,7 +742,7 @@ phase_apps() {
   clone_or_update EchoService "$DIR/echo/EchoService"
   clone_or_update EchoMedia "$DIR/echo/EchoMedia"
   local f
-  [ -f "$DIR/echo/EchoWeb/deploy/environment/compose.yaml" ] || die "EchoWeb@$BRANCH has no deploy/environment (the Echo environment template): use a branch that has it, e.g. --branch dev"
+  [ -f "$DIR/echo/EchoWeb/deploy/environment/compose.yaml" ] || (( DRY )) || die "EchoWeb@$(git -C "$DIR/echo/EchoWeb" branch --show-current) has no deploy/environment (the Echo environment template): that branch predates it; use one that has it"
   for f in compose.yaml web.host.yaml service.host.yaml deploy.sh; do
     if [ ! -e "$DIR/echo/$f" ]; then
       note "echo/$f from EchoWeb/deploy/environment"
