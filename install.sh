@@ -16,11 +16,12 @@
 #
 # (it then clones this repository under --dir and continues from there).
 # Every value it needs is a flag or a prompt; nothing is guessed about the
-# domain. Re-running is safe: existing .env values, rows with a value and
-# accounts are kept. README.md describes each phase.
+# domain. Re-running detects saved values: Enter keeps them, and secrets
+# stay hidden. Existing database accounts are kept. README.md describes each phase.
+set +x # Passwords/tokens must not appear even when invoked with bash -x.
 set -euo pipefail
 
-SELF=$(readlink -f "$0")
+SELF=$(readlink -f "${BASH_SOURCE[0]:-$0}")
 SELF_DIR=$(cd "$(dirname "$SELF")" && pwd)
 GIT_BASE=${AIDA_GIT_BASE:-https://github.com/localsplash}
 
@@ -45,6 +46,11 @@ TOKEN_AIDA_AGENT=${TOKEN_AIDA_AGENT:-}
 TOKEN_ECHO_WEB=${TOKEN_ECHO_WEB:-}
 TOKEN_ECHO_SERVICE=${TOKEN_ECHO_SERVICE:-}
 TOKEN_OFFICEPULSE=${TOKEN_OFFICEPULSE:-}
+
+# Persisted values are defaults, not explicit overrides. Never source an .env.
+declare -A SAVED_VALUES=() GIVEN_INPUTS=()
+OFFICEPULSE_ENV_FILE=/etc/aida-integration/env
+SAVE_INSTALLER_TOKEN=0
 
 # The store, found by name. PLATFORMCONFIG_BASE exists for the installer's
 # own tests against a throwaway base; deployments never set it.
@@ -78,9 +84,9 @@ Options
   --data-dir PATH          database: host directory for MySQL's and NocoDB's data (default /var/lib/aidaplatformdb)
   --token-identity, --token-aida-admin, --token-aida-agent, --token-echo-web,
   --token-echo-service, --token-officepulse   per-application NocoDB API tokens
-  --yes                    never prompt; a missing value is an error
+  --yes                    never prompt; use saved values/defaults unless explicitly overridden
   --no-deploy              clone, write .env files, create accounts and rows, but do not build or start
-  --dry-run                print what would happen and change nothing
+  --dry-run                preview changes with secrets hidden; skip checkout auto-update
   -h, --help
 EOF
 }
@@ -89,29 +95,68 @@ log()  { printf '\n==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 die()  { echo "install: $*" >&2; exit 2; }
 # Dry runs print the command with secret-looking values masked.
-run()  { if (( DRY )); then printf '    + %s\n' "$(printf '%s ' "$@" | sed -E "s/((PASSWORD|SECRET|TOKEN|PWD)=)[^ ]*/\\1<secret>/g; s/(IDENTIFIED BY ')[^']*'/\\1<secret>'/g; s#(mysql://[^:]+:)[^@]*@#\\1<secret>@#g")"; else "$@"; fi; }
+run() {
+  if ! (( DRY )); then "$@"; return; fi
+  local arg hide_next=0
+  printf '    +'
+  for arg in "$@"; do
+    if (( hide_next )); then arg='<hidden>'; hide_next=0
+    elif [[ $arg == *=* ]] && is_secret_key "${arg%%=*}"; then arg="${arg%%=*}=<hidden>"
+    elif [[ ${arg^^} == *'IDENTIFIED BY'* || $arg == *://*:*@* ]]; then arg='<credentials hidden>'
+    elif [[ $arg == --* ]] && is_secret_key "$arg"; then hide_next=1
+    fi
+    printf ' %q' "$arg"
+  done
+  printf '\n'
+}
 have() { command -v "$1" >/dev/null 2>&1; }
 secret() { openssl rand -hex 32; }
 
-# ask VAR --flag "prompt" [default]: keeps a value already given, otherwise
-# prompts on the terminal (or takes the default under --yes / without one).
-# Prompts read /dev/tty, so `curl | bash` — whose stdin is the script — works.
-# A password, secret or token is typed without echo: it must not end up in
-# the terminal's scrollback or in a pasted transcript.
-ask() {
-  local var=$1 flag=$2 prompt=$3 default=${4:-} value
-  [ -n "${!var}" ] && return 0
-  if (( YES )) || ! { : < /dev/tty; } 2>/dev/null; then
-    [ -n "$default" ] && { printf -v "$var" '%s' "$default"; return 0; }
-    die "$prompt: give it with $flag"
-  fi
-  if [[ $var =~ (PASSWORD|SECRET|TOKEN) ]]; then
-    read -rs -p "$prompt (not echoed): " value < /dev/tty; echo > /dev/tty
+# A value explicitly supplied by flag/environment wins. Otherwise show the
+# saved value (or fresh default) and let Enter keep it. /dev/tty also supports
+# curl | bash. EOF is an abort, not permission to replace a saved secret.
+is_secret_key() {
+  local key=${1^^}; key=${key//-/_}
+  [[ $key =~ (PASSWORD|PASS|SECRET|TOKEN|API_KEY|PRIVATE_KEY|PWD|DATABASE_URL) ]]
+}
+shown_value() {
+  if [[ ${3:-false} = true || ${3:-false} = 1 ]] || is_secret_key "$1" || [[ $2 == *://*:*@* ]]; then
+    printf '<configured; hidden>'
   else
-    read -r -p "$prompt${default:+ [$default]}: " value < /dev/tty
+    printf '%s' "$2"
+  fi
+}
+validate_input() {
+  case $1 in
+    ENVIRONMENT_NAME) case $2 in dev|staging|prod) ;; *) die 'Environment name must be dev, staging or prod' ;; esac ;;
+    DATA_DIR) [[ $2 == /* ]] || die 'DATA_DIR must be an absolute path' ;;
+  esac
+}
+ask() {
+  local var=$1 flag=$2 prompt=$3 default=${SAVED_VALUES[$1]:-${4:-}} value
+  if [ -n "${!var}" ]; then
+    validate_input "$var" "${!var}"
+    note "$prompt: $(shown_value "$var" "${!var}") (selected)"
+    return 0
+  fi
+  if (( YES )) || ! { : < /dev/tty; } 2>/dev/null; then
+    [ -n "$default" ] || die "$prompt: give it with $flag"
+    validate_input "$var" "$default"
+    printf -v "$var" '%s' "$default"
+    note "$prompt: $(shown_value "$var" "$default") (kept)"
+    return 0
+  fi
+  if is_secret_key "$var"; then
+    local hint='not echoed'
+    [ -z "$default" ] || hint='configured; Enter to keep, or type a replacement; not echoed'
+    IFS= read -rs -p "$prompt [$hint]: " value < /dev/tty || die "Input cancelled for $var"
+    echo > /dev/tty
+  else
+    IFS= read -r -p "$prompt${default:+ [$default]}: " value < /dev/tty || die "Input cancelled for $var"
   fi
   printf -v "$var" '%s' "${value:-$default}"
   [ -n "${!var}" ] || die "$prompt is required"
+  validate_input "$var" "${!var}"
 }
 
 # The apex domain. Defaults to this host's own domain (its FQDN minus the host
@@ -130,7 +175,7 @@ ask_parent_domain() {
     if ! [[ $PARENT_DOMAIN =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
       (( YES )) && die "--parent-domain '$PARENT_DOMAIN' is not a domain name"
       note "'$PARENT_DOMAIN' is not a domain name (letters, digits, hyphens and dots, e.g. example.com)"
-      PARENT_DOMAIN=""; continue
+      PARENT_DOMAIN=""; unset 'SAVED_VALUES[PARENT_DOMAIN]'; continue
     fi
     label=${PARENT_DOMAIN%%.*}
     local suspicious=""
@@ -146,7 +191,7 @@ ask_parent_domain() {
     if (( YES )) || ! { : < /dev/tty; } 2>/dev/null; then note "Accepting it as given (--yes)."; return 0; fi
     read -r -p "Use '$PARENT_DOMAIN' as the apex domain anyway? [y/N] " answer < /dev/tty
     case ${answer,,} in y|yes) return 0 ;; esac
-    PARENT_DOMAIN=""
+    PARENT_DOMAIN=""; unset 'SAVED_VALUES[PARENT_DOMAIN]'
   done
 }
 
@@ -188,16 +233,183 @@ ensure_dir() {
 # env_set FILE KEY VALUE: sets KEY when the file has no non-blank value for it.
 env_set() {
   local file=$1 key=$2 value=$3
-  if (( DRY )); then echo "    + $file: $key=$([[ $key =~ (PASSWORD|SECRET|TOKEN) ]] && echo '<secret>' || echo "$value")"; return; fi
+  local current; current=$(env_get "$file" "$key")
+  if [ -n "$current" ]; then note "$file: $key=$(shown_value "$key" "$current") (kept)"; return; fi
+  if (( DRY )); then note "$file: $key=$(shown_value "$key" "$value") (would set)"; return; fi
   [ -f "$file" ] || { : > "$file"; chmod 600 "$file"; }
   if grep -qE "^${key}=.+" "$file"; then return; fi
   sed -i "/^${key}=\s*$/d" "$file"
   printf '%s=%s\n' "$key" "$value" >> "$file"
 }
 
-env_get() { # FILE KEY -> value, or nothing; never fails (set -e would end the script)
+env_get() { # FILE KEY -> literal value; no eval or shell execution
   [ -f "$1" ] || return 0
-  { grep -E "^$2=" "$1" || true; } | tail -1 | cut -d= -f2- | sed -E "s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/"
+  local line value='' decoded next i
+  local pattern="^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*="
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ $line =~ $pattern ]] || continue
+    value=${line#*=}; value=${value%$'\r'}
+    value="${value#"${value%%[![:space:]]*}"}"
+    if [[ $value == \'* ]]; then
+      value=${value#\'}; value=${value%\'*}
+      value=${value//\\\'/\'}
+    elif [[ $value == \"* ]]; then
+      value=${value#\"}; value=${value%\"*}
+      # Decode only the escapes emitted by env_write, without evaluating variables.
+      decoded=''
+      for ((i=0; i<${#value}; i++)); do
+        next=${value:i:1}
+        if [[ $next == \\ && $((i+1)) -lt ${#value} ]]; then
+          case ${value:i+1:1} in
+            '\'|'"'|'$'|'`') ((i+=1)); next=${value:i:1} ;;
+          esac
+        fi
+        decoded+=$next
+      done
+      value=$decoded
+    else
+      value=${value%%[[:space:]]#*}
+      value="${value%"${value##*[![:space:]]}"}"
+    fi
+  done < "$1"
+  printf '%s' "$value"
+}
+
+# Only reviewed bootstrap inputs use replacement semantics. Generated database
+# credentials still use env_set/row_default and are never rotated by a rerun.
+env_write() { # FILE KEY VALUE
+  local file=$1 key=$2 value=$3 current temp line quoted
+  current=$(env_get "$file" "$key")
+  if [ -n "$current" ] && [ "$current" = "$value" ]; then
+    note "$file: $key=$(shown_value "$key" "$current") (kept)"
+    return 0
+  fi
+  [[ $value != *$'\n'* && $value != *$'\r'* ]] || die "$key must be a single-line bootstrap value"
+  note "$file: $key=$(shown_value "$key" "$value") (saved)"
+  (( DRY )) && return 0
+  # Double-quote complex values and escape exactly the characters Compose and
+  # systemd treat specially. In particular a trailing backslash must not swallow
+  # the closing quote, and a literal dollar must not become interpolation.
+  if [[ $value =~ ^[a-zA-Z0-9_./:@%+,=-]+$ ]]; then quoted=$value
+  else
+    quoted=${value//\\/\\\\}
+    quoted=${quoted//\"/\\\"}
+    quoted=${quoted//\$/\\\$}
+    quoted="\"$quoted\""
+  fi
+  temp=$(mktemp "${file}.tmp.XXXXXX") || die "Cannot create temporary file beside $file"
+  chmod 600 "$temp"
+  if [ -f "$file" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      [[ $line =~ ^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*= ]] || printf '%s\n' "$line" >> "$temp"
+    done < "$file"
+    chown --reference="$file" "$temp" 2>/dev/null || { rm -f "$temp"; die "Cannot preserve ownership of $file"; }
+  fi
+  printf '%s=%s\n' "$key" "$quoted" >> "$temp"
+  mv -f -- "$temp" "$file"
+}
+
+env_apply() { # Keep a per-app URL override on Enter; replace on an explicit change.
+  if [ "$2" = NOCODB_BASE_URL ] && [ -z "${GIVEN_INPUTS[NOCODB_BASE_URL]:-}" ] &&
+     [ "$3" = "${SAVED_VALUES[NOCODB_BASE_URL]:-}" ]; then
+    env_set "$@"
+  else
+    env_write "$@"
+  fi
+}
+
+ask_installer_token() { # Optional dedicated installer token; otherwise use the app token.
+  if [ -n "${NOCODB_TOKEN:-${SAVED_VALUES[NOCODB_TOKEN]:-}}" ]; then
+    ask NOCODB_TOKEN --nocodb-token "NocoDB installer API token"
+    SAVE_INSTALLER_TOKEN=1
+  else
+    NOCODB_TOKEN=$1
+  fi
+}
+
+saved_env() { # VAR FILE KEY; first nonblank source wins
+  [ -z "${SAVED_VALUES[$1]:-}" ] || return 0
+  local value; value=$(env_get "$2" "$3")
+  [ -z "$value" ] || SAVED_VALUES[$1]=$value
+  return 0
+}
+
+load_saved_inputs() {
+  local var file
+  for var in PARENT_DOMAIN ENVIRONMENT_NAME NOCODB_BASE_URL NOCODB_TOKEN TRUSTED_CIDR DB_HOST MYSQL_PUBLISH DATA_DIR MYSQL_ADMIN_PASSWORD TOKEN_IDENTITY TOKEN_AIDA_ADMIN TOKEN_AIDA_AGENT TOKEN_ECHO_WEB TOKEN_ECHO_SERVICE TOKEN_OFFICEPULSE; do
+    [ -z "${!var}" ] || GIVEN_INPUTS[$var]=1
+  done
+  saved_env PARENT_DOMAIN "$SELF_DIR/.env" INSTALL_PARENT_DOMAIN
+  saved_env ENVIRONMENT_NAME "$SELF_DIR/.env" INSTALL_ENVIRONMENT_NAME
+  saved_env NOCODB_TOKEN "$SELF_DIR/.env" NOCODB_INSTALLER_TOKEN
+  saved_env MYSQL_ADMIN_PASSWORD "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD
+  saved_env MYSQL_PUBLISH "$SELF_DIR/.env" MYSQL_PUBLISH
+  saved_env DATA_DIR "$SELF_DIR/.env" DATA_DIR
+  saved_env TOKEN_IDENTITY "$DIR/identity/.env" NOCODB_API_TOKEN
+  saved_env TOKEN_AIDA_ADMIN "$DIR/aida/AidaAdmin/.env" NOCODB_API_TOKEN
+  saved_env TOKEN_AIDA_AGENT "$DIR/aida/AidaAgent/.env" NOCODB_API_TOKEN
+  saved_env TOKEN_ECHO_WEB "$DIR/echo/.env" ECHO_WEB_NOCODB_API_TOKEN
+  saved_env TOKEN_ECHO_SERVICE "$DIR/echo/.env" ECHO_SERVICE_NOCODB_API_TOKEN
+  saved_env TOKEN_OFFICEPULSE "$OFFICEPULSE_ENV_FILE" NOCODB_API_TOKEN
+  saved_env DB_HOST "$DIR/echo/.env" ECHO_DB_HOST
+  local files=("$SELF_DIR/.env" "$DIR/identity/.env" "$DIR/aida/AidaAdmin/.env" "$DIR/aida/AidaAgent/.env" "$DIR/echo/.env")
+  [ "$PHASE" != officepulse ] || files=("$OFFICEPULSE_ENV_FILE" "${files[@]}")
+  for file in "${files[@]}"; do saved_env NOCODB_BASE_URL "$file" NOCODB_BASE_URL; done
+  # Upgrade path for old installs without installer hints.
+  local url=${NOCODB_BASE_URL:-${SAVED_VALUES[NOCODB_BASE_URL]:-}}
+  if [[ $url =~ ^https?://nocodb\.([^/:]+)(:[0-9]+)?/?$ ]] && [ -z "${SAVED_VALUES[PARENT_DOMAIN]:-}" ]; then
+    SAVED_VALUES[PARENT_DOMAIN]=${BASH_REMATCH[1]}
+  fi
+}
+
+# Resolve authoritative shared settings before prompting when the saved endpoint
+# is already up. This probe is GET-only; the normal phase still validates access.
+load_saved_platform_inputs() {
+  local url=${NOCODB_BASE_URL:-${SAVED_VALUES[NOCODB_BASE_URL]:-}} token=${NOCODB_TOKEN:-${SAVED_VALUES[NOCODB_TOKEN]:-}}
+  if [ -z "$token" ]; then
+    if [ "$PHASE" = officepulse ]; then token=${TOKEN_OFFICEPULSE:-${SAVED_VALUES[TOKEN_OFFICEPULSE]:-}}
+    else token=${TOKEN_IDENTITY:-${SAVED_VALUES[TOKEN_IDENTITY]:-}}; fi
+  fi
+  [ -n "$url" ] && [ -n "$token" ] || return 0
+  local bases tables base table rows page count offset=0 key value
+  local client=(curl --connect-timeout 5 --max-time 15 -fsS -H "xc-token: $token")
+  bases=$("${client[@]}" "$url/api/v2/meta/bases" 2>/dev/null) || return 0
+  base=$(jq -er --arg t "$BASE_NAME" '[.list[] | select(.title==$t)] | select(length==1) | .[0].id' <<<"$bases") || return 0
+  tables=$("${client[@]}" "$url/api/v2/meta/bases/$base/tables" 2>/dev/null) || return 0
+  table=$(jq -er --arg t "$TABLE_NAME" '[.list[] | select(.title==$t)] | select(length==1) | .[0].id' <<<"$tables") || return 0
+  rows='[]'
+  while :; do
+    page=$("${client[@]}" "$url/api/v2/tables/$table/records?limit=200&offset=$offset" 2>/dev/null) || return 0
+    count=$(jq -er '.list | length' <<<"$page") || return 0
+    rows=$(jq -s '.[0] + .[1].list' <(printf '%s' "$rows") <(printf '%s' "$page")) || return 0
+    [ "$count" -ge 200 ] || break
+    offset=$((offset + 200))
+  done
+  for key in PARENT_DOMAIN ENVIRONMENT_NAME; do
+    value=$(jq -r --arg k "$key" '[.[] | select(.app=="*" and .settingKey==$k)] | if length==1 then .[0].settingValue // "" else "" end' <<<"$rows")
+    [ -z "$value" ] || SAVED_VALUES[$key]=$value
+  done
+}
+
+# After NocoDB starts, reconcile any offline hints with the actual rows. Explicit
+# flag/env choices win; otherwise display the real current value before changes.
+sync_platform_identity() {
+  local var current
+  for var in PARENT_DOMAIN ENVIRONMENT_NAME; do
+    current=$(row_get '*' "$var")
+    if [ -n "$current" ] && [ "$current" != "${!var}" ] && [ -z "${GIVEN_INPUTS[$var]:-}" ] &&
+       [ "${!var}" = "${SAVED_VALUES[$var]:-${!var}}" ]; then
+      SAVED_VALUES[$var]=$current
+      printf -v "$var" '%s' ''
+      if [ "$var" = PARENT_DOMAIN ]; then ask_parent_domain
+      else ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" dev; fi
+    fi
+    case $var in ENVIRONMENT_NAME) case $ENVIRONMENT_NAME in dev|staging|prod) ;; *) die 'Environment name must be dev, staging or prod' ;; esac ;; esac
+    if [ -n "$current" ] && [ "$current" != "${!var}" ]; then row_set '*' "$var" "${!var}"
+    else row_ensure '*' "$var" "${!var}" false 'Platform installation identity.'; fi
+  done
+  env_write "$SELF_DIR/.env" INSTALL_PARENT_DOMAIN "$PARENT_DOMAIN"
+  env_write "$SELF_DIR/.env" INSTALL_ENVIRONMENT_NAME "$ENVIRONMENT_NAME"
 }
 
 # ── Git ──────────────────────────────────────────────────────────────────────
@@ -314,10 +526,12 @@ row_get() { # APP KEY -> value ('' when absent or blank)
 # row_ensure APP KEY VALUE SECRET(true|false) DESCRIPTION: creates the row, or
 # fills a blank one; a row that already has a value is left alone.
 row_ensure() {
-  local app=$1 key=$2 value=$3 secret=$4 desc=$5 id shown
-  shown=$value; [ "$secret" = true ] && shown='<secret>'
+  local app=$1 key=$2 value=$3 secret=$4 desc=$5 id shown stored_secret
+  stored_secret=$(jq -r --arg a "$app" --arg k "$key" '[.[] | select(.app==$a and .settingKey==$k)] | .[0].bSecret // false' <<<"$ROWS_JSON")
+  [[ $stored_secret != true && $stored_secret != 1 ]] || secret=true
+  shown=$(shown_value "$key" "$value" "$secret")
   id=$(jq -r --arg a "$app" --arg k "$key" '[.[] | select(.app==$a and .settingKey==$k)] | .[0].Id // ""' <<<"$ROWS_JSON")
-  if [ -n "$id" ] && [ -n "$(row_get "$app" "$key")" ]; then note "row $app/$key kept"; return; fi
+  if [ -n "$id" ] && [ -n "$(row_get "$app" "$key")" ]; then note "row $app/$key=$(shown_value "$key" "$(row_get "$app" "$key")" "$secret") (kept)"; return; fi
   if [ -n "$id" ]; then
     note "row $app/$key filled in: $shown"
     (( DRY )) || nc "/api/v2/tables/$TABLE_ID/records" -X PATCH --data "$(jq -n --argjson id "$id" --arg v "$value" '[{Id:$id, settingValue:$v}]')" >/dev/null
@@ -331,8 +545,9 @@ row_ensure() {
 # row_set APP KEY VALUE: changes an existing row's value (creates it if absent).
 row_set() {
   local id; id=$(jq -r --arg a "$1" --arg k "$2" '[.[] | select(.app==$a and .settingKey==$k)] | .[0].Id // ""' <<<"$ROWS_JSON")
-  if [ -z "$id" ]; then row_ensure "$1" "$2" "$3" false ""; return; fi
-  note "row $1/$2 updated: $3"
+  if [ -z "$id" ]; then row_ensure "$1" "$2" "$3" "$(is_secret_key "$2" && echo true || echo false)" ""; return; fi
+  local hidden; hidden=$(jq -r --arg a "$1" --arg k "$2" '[.[] | select(.app==$a and .settingKey==$k)] | .[0].bSecret // false' <<<"$ROWS_JSON")
+  note "row $1/$2 updated: $(shown_value "$2" "$3" "$hidden")"
   (( DRY )) || nc "/api/v2/tables/$TABLE_ID/records" -X PATCH --data "$(jq -n --argjson id "$id" --arg v "$3" '[{Id:$id, settingValue:$v}]')" >/dev/null
   (( DRY )) || rows_load
 }
@@ -346,7 +561,13 @@ row_default() {
   ROW_VALUE=$(row_get "$1" "$2"; printf '\001')
   ROW_VALUE=${ROW_VALUE%$'\001'}
   ROW_VALUE=${ROW_VALUE%$'\n'}
-  if [ -n "$ROW_VALUE" ]; then note "row $1/$2 kept"; return; fi
+  if [ -n "$ROW_VALUE" ]; then
+    local hidden=$4 stored_secret
+    stored_secret=$(jq -r --arg a "$1" --arg k "$2" '[.[] | select(.app==$a and .settingKey==$k)] | .[0].bSecret // false' <<<"$ROWS_JSON")
+    [[ $stored_secret != true && $stored_secret != 1 ]] || hidden=true
+    note "row $1/$2=$(shown_value "$2" "$ROW_VALUE" "$hidden") (kept)"
+    return
+  fi
   row_ensure "$@"
   ROW_VALUE=$3
 }
@@ -596,13 +817,13 @@ phase_database() {
   prereqs docker git jq openssl curl
   ask_parent_domain
   ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" dev
-  NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
-  # Loopback serves applications on this host; other hosts need MySQL on an
-  # address they can reach, and a name for it.
-  if [ -z "$MYSQL_PUBLISH" ] && [ -z "$(env_get "$SELF_DIR/.env" MYSQL_PUBLISH)" ] && ! (( YES )) && { : < /dev/tty; } 2>/dev/null; then
-    local answer
-    read -r -p "Will the applications run on other hosts? MySQL then listens on 0.0.0.0:3306 as lsdb.$PARENT_DOMAIN [y/N] " answer < /dev/tty
-    case ${answer,,} in y|yes) MYSQL_PUBLISH=0.0.0.0:3306 ;; esac
+  ask NOCODB_BASE_URL --nocodb-base-url "NocoDB public URL" "https://nocodb.$PARENT_DOMAIN"
+  ask MYSQL_PUBLISH --mysql-publish "MySQL listen address (use 0.0.0.0:3306 for remote hosts)" 127.0.0.1:3306
+  ask DATA_DIR --data-dir "Existing MySQL and NocoDB data directory" /var/lib/aidaplatformdb
+  local old_data=${SAVED_VALUES[DATA_DIR]:-/var/lib/aidaplatformdb}
+  if [ "$(readlink -m "$DATA_DIR")" != "$(readlink -m "$old_data")" ] &&
+     { [ -n "$(ls -A "$old_data/mysql" 2>/dev/null)" ] || [ -n "$(ls -A "$old_data/nocodb" 2>/dev/null)" ]; }; then
+    die "DATA_DIR contains an existing installation; move its data explicitly before selecting a different directory"
   fi
 
   log "External networks and the data directories"
@@ -614,11 +835,14 @@ phase_database() {
   ensure_dir "$data_dir/nocodb"
 
   log "$SELF_DIR/.env"
-  env_set "$SELF_DIR/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
-  env_set "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD "$(secret)"
-  env_set "$SELF_DIR/.env" NC_AUTH_JWT_SECRET "$(secret)"
-  [ -n "$MYSQL_PUBLISH" ] && env_set "$SELF_DIR/.env" MYSQL_PUBLISH "$MYSQL_PUBLISH"
-  [ -n "$DATA_DIR" ] && env_set "$SELF_DIR/.env" DATA_DIR "$DATA_DIR"
+  env_write "$SELF_DIR/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  local key current
+  for key in MYSQL_ROOT_PASSWORD NC_AUTH_JWT_SECRET; do
+    current=$(env_get "$SELF_DIR/.env" "$key")
+    env_set "$SELF_DIR/.env" "$key" "${current:-$(secret)}"
+  done
+  [ -n "$MYSQL_PUBLISH" ] && env_write "$SELF_DIR/.env" MYSQL_PUBLISH "$MYSQL_PUBLISH"
+  [ -n "$DATA_DIR" ] && env_write "$SELF_DIR/.env" DATA_DIR "$DATA_DIR"
 
   local unmigrated; unmigrated=$(unmigrated_volumes "$data_dir")
   if [ -n "$unmigrated" ]; then
@@ -637,24 +861,28 @@ phase_database() {
   note "     created in, so it has to exist before the tokens do),"
   note "  2. in that base, create one API token per application: installer, identity,"
   note "     aida-admin, aida-agent, echo-web, echo-service, and officepulse if you run it."
-  if [ -z "$NOCODB_TOKEN" ] && { (( YES )) || [ ! -t 0 ]; }; then
+  if [ -z "${NOCODB_TOKEN:-${SAVED_VALUES[NOCODB_TOKEN]:-}}" ] && { (( YES )) || ! { : < /dev/tty; } 2>/dev/null; }; then
     note "No --nocodb-token: skipping the PlatformConfig rows. Re-run with a token to seed them."
   else
     ask NOCODB_TOKEN --nocodb-token "The installer token"
     log "PlatformConfig"
     ensure_platformconfig
-    ask TRUSTED_CIDR --trusted-cidr "trustedCIDR: the networks the platform's servers sit on" "$(default_trusted_cidr)"
-    row_ensure '*' PARENT_DOMAIN "$PARENT_DOMAIN" false "Apex domain (X.TLD) every application lives under; apps derive https://<app>.<PARENT_DOMAIN> from it."
-    row_ensure '*' ENVIRONMENT_NAME "$ENVIRONMENT_NAME" false "dev, staging or prod; shown by the applications so nobody mistakes one environment for another."
+    env_write "$SELF_DIR/.env" NOCODB_INSTALLER_TOKEN "$NOCODB_TOKEN"
+    sync_platform_identity
+    local current_cidr; current_cidr=$(row_get '*' trustedCIDR)
+    ask TRUSTED_CIDR --trusted-cidr "trustedCIDR: the networks the platform's servers sit on" "${current_cidr:-$(default_trusted_cidr)}"
+    [ -z "$current_cidr" ] || [ "$current_cidr" = "$TRUSTED_CIDR" ] || row_set '*' trustedCIDR "$TRUSTED_CIDR"
     row_ensure '*' trustedCIDR "$TRUSTED_CIDR" false "IPv4 CIDRs (comma-separated) the platform's servers sit on. One value for the whole platform: every application admits server-to-server callers by it."
     database_accounts
   fi
 
+  env_write "$SELF_DIR/.env" INSTALL_PARENT_DOMAIN "$PARENT_DOMAIN"
+  env_write "$SELF_DIR/.env" INSTALL_ENVIRONMENT_NAME "$ENVIRONMENT_NAME"
   local publish; publish=${MYSQL_PUBLISH:-$(env_get "$SELF_DIR/.env" MYSQL_PUBLISH)}
   log "Done. What only you can do:"
   note "1. NocoDB holds every secret the platform has. Block $NOCODB_BASE_URL from the public"
   note "   internet at the reverse proxy, or allow only trustedCIDR."
-  note "2. The MySQL root password is: $( (( DRY )) && echo '<generated>' || env_get "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD )"
+  note "2. MySQL root password: <configured; hidden>. It is not printed by the installer."
   note "   It lives in $SELF_DIR/.env (mode 600) and nowhere else — not in NocoDB, where every"
   note "   application's token could read it. Nothing else needs it: the applications' accounts were"
   note "   created here and their passwords are their own rows."
@@ -779,18 +1007,18 @@ phase_apps() {
   prereqs docker git jq openssl curl
   ask_parent_domain
   ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" dev
-  NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
+  ask NOCODB_BASE_URL --nocodb-base-url "NocoDB public URL" "https://nocodb.$PARENT_DOMAIN"
   ask TOKEN_IDENTITY --token-identity "NocoDB API token for identity"
   ask TOKEN_AIDA_ADMIN --token-aida-admin "NocoDB API token for aida-admin"
   ask TOKEN_AIDA_AGENT --token-aida-agent "NocoDB API token for aida-agent"
   ask TOKEN_ECHO_WEB --token-echo-web "NocoDB API token for echo-web"
   ask TOKEN_ECHO_SERVICE --token-echo-service "NocoDB API token for echo-service"
-  NOCODB_TOKEN=${NOCODB_TOKEN:-$TOKEN_IDENTITY}
+  ask_installer_token "$TOKEN_IDENTITY"
 
   log "PlatformConfig"
   ensure_platformconfig
-  row_ensure '*' PARENT_DOMAIN "$PARENT_DOMAIN" false "Apex domain (X.TLD) every application lives under; apps derive https://<app>.<PARENT_DOMAIN> from it."
-  row_ensure '*' ENVIRONMENT_NAME "$ENVIRONMENT_NAME" false "dev, staging or prod; shown by the applications so nobody mistakes one environment for another."
+  if (( SAVE_INSTALLER_TOKEN )); then env_write "$SELF_DIR/.env" NOCODB_INSTALLER_TOKEN "$NOCODB_TOKEN"; fi
+  sync_platform_identity
   # trustedCIDR is platform-wide; the database host wrote its own networks, and
   # this host's (its Docker subnets and its address, as the other hosts see
   # its calls) must be in it too, or nothing here can call anything.
@@ -799,7 +1027,7 @@ phase_apps() {
   if [ -n "$current_cidr" ] && [ "$proposed_cidr" != "$current_cidr" ]; then
     note "trustedCIDR ($current_cidr) does not cover this host; proposing to add its networks"
   fi
-  ask TRUSTED_CIDR --trusted-cidr "trustedCIDR: the networks the platform's servers sit on" "$proposed_cidr"
+  ask TRUSTED_CIDR --trusted-cidr "trustedCIDR: the networks the platform's servers sit on" "${current_cidr:-$proposed_cidr}"
   if [ -z "$current_cidr" ]; then
     row_ensure '*' trustedCIDR "$TRUSTED_CIDR" false "IPv4 CIDRs (comma-separated) the platform's servers sit on. One value for the whole platform: every application admits server-to-server callers by it."
   elif [ "$TRUSTED_CIDR" != "$current_cidr" ]; then
@@ -811,11 +1039,15 @@ phase_apps() {
   # MySQL: the container from `install.sh database` when it is on this host,
   # otherwise the name the rows (or the platform convention) give it.
   local db_local=0 db_default
-  db_default=$(row_get echo DB_HOST); db_default=${db_default:-lsdb.$PARENT_DOMAIN}
-  if docker container inspect platform-mysql-local >/dev/null 2>&1; then db_default=platform-mysql-local; fi
+  db_default=$(row_get echo DB_HOST)
+  [ -n "$db_default" ] || db_default=$(row_get aida-admin DB_HOST)
+  db_default=${db_default:-${SAVED_VALUES[DB_HOST]:-}}
+  if [ -z "$db_default" ] && docker container inspect platform-mysql-local >/dev/null 2>&1; then db_default=platform-mysql-local; fi
+  db_default=${db_default:-lsdb.$PARENT_DOMAIN}
+  SAVED_VALUES[DB_HOST]=$db_default
   ask DB_HOST --db-host "MySQL host as the applications reach it" "$db_default"
   [ "$DB_HOST" = platform-mysql-local ] && db_local=1
-  if ! (( db_local )) && ! timeout 5 bash -c "exec 3<>/dev/tcp/$DB_HOST/3306" 2>/dev/null; then
+  if ! (( db_local )) && ! timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/3306"' bash "$DB_HOST" 2>/dev/null; then
     note "MySQL at $DB_HOST:3306 is not reachable from this host. On the database host, MySQL must"
     note "listen beyond loopback (MYSQL_PUBLISH=0.0.0.0:3306 in its AidaPlatformDB/.env, then"
     note "docker compose up -d; firewall it to trustedCIDR) and $DB_HOST must resolve to it."
@@ -832,14 +1064,14 @@ phase_apps() {
     note "MySQL accounts exist (created by 'install.sh database'); Echo's jobs run as $admin_user"
   else
     admin_user=root
-    if (( db_local )); then MYSQL_ADMIN_PASSWORD=${MYSQL_ADMIN_PASSWORD:-$(env_get "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD)}; fi
+    if (( db_local )); then saved_env MYSQL_ADMIN_PASSWORD "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD; fi
     [ -n "$MYSQL_ADMIN_PASSWORD" ] || note "The database host has not created the applications' accounts (re-run 'install.sh database' there, or give its MYSQL_ROOT_PASSWORD from AidaPlatformDB/.env here, used once and kept only in echo/.env for Echo's jobs)."
     ask MYSQL_ADMIN_PASSWORD --mysql-admin-password "MySQL root password on $DB_HOST"
     admin_pw=$MYSQL_ADMIN_PASSWORD
   fi
 
   if ! (( aida_accounts_done )); then
-    if (( db_local )); then MYSQL_ADMIN_PASSWORD=${MYSQL_ADMIN_PASSWORD:-$(env_get "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD)}; fi
+    if (( db_local )); then saved_env MYSQL_ADMIN_PASSWORD "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD; fi
     note "Aida database accounts need provisioning; use this host's MySQL root once, or run 'install.sh database' on the database host first."
     ask MYSQL_ADMIN_PASSWORD --mysql-admin-password "MySQL root password on $DB_HOST"
   fi
@@ -881,21 +1113,24 @@ phase_apps() {
     fi
   done
 
-  log ".env files (existing values are kept)"
-  env_set "$DIR/identity/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
-  env_set "$DIR/identity/.env" NOCODB_API_TOKEN "$TOKEN_IDENTITY"
-  env_set "$DIR/aida/AidaAdmin/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
-  env_set "$DIR/aida/AidaAdmin/.env" NOCODB_API_TOKEN "$TOKEN_AIDA_ADMIN"
-  env_set "$DIR/aida/AidaAgent/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
-  env_set "$DIR/aida/AidaAgent/.env" NOCODB_API_TOKEN "$TOKEN_AIDA_AGENT"
+  log ".env files (Enter keeps existing values; selected replacements are saved)"
+  env_apply "$DIR/identity/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  env_apply "$DIR/identity/.env" NOCODB_API_TOKEN "$TOKEN_IDENTITY"
+  env_apply "$DIR/aida/AidaAdmin/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  env_apply "$DIR/aida/AidaAdmin/.env" NOCODB_API_TOKEN "$TOKEN_AIDA_ADMIN"
+  env_apply "$DIR/aida/AidaAgent/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  env_apply "$DIR/aida/AidaAgent/.env" NOCODB_API_TOKEN "$TOKEN_AIDA_AGENT"
   local echo_env="$DIR/echo/.env"
-  env_set "$echo_env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
-  env_set "$echo_env" ECHO_WEB_NOCODB_API_TOKEN "$TOKEN_ECHO_WEB"
-  env_set "$echo_env" ECHO_SERVICE_NOCODB_API_TOKEN "$TOKEN_ECHO_SERVICE"
+  env_apply "$echo_env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  env_apply "$echo_env" ECHO_WEB_NOCODB_API_TOKEN "$TOKEN_ECHO_WEB"
+  env_apply "$echo_env" ECHO_SERVICE_NOCODB_API_TOKEN "$TOKEN_ECHO_SERVICE"
   env_set "$echo_env" ECHO_NETWORK "$ECHO_NETWORK"
   env_set "$echo_env" ECHO_MEDIA_VOLUME echo-media-data
   env_set "$echo_env" ECHO_SERVICE_LOGS_VOLUME echo-service-logs
-  env_set "$echo_env" ECHO_DB_HOST "$DB_HOST"
+  # DB_HOST seeds missing coordinates; never redirect existing Echo jobs while
+  # the applications still use their preserved PlatformConfig database host.
+  local echo_db_host; echo_db_host=$(row_get echo DB_HOST)
+  env_set "$echo_env" ECHO_DB_HOST "${echo_db_host:-$DB_HOST}"
   env_set "$echo_env" MYSQL_ADMIN_USER "$admin_user"
   env_set "$echo_env" MYSQL_ADMIN_PASSWORD "$admin_pw"
   local web_pw service_pw
@@ -1000,21 +1235,22 @@ phase_officepulse() {
     note "Asterisk is not running on this host (systemctl is-active asterisk). OfficePulse needs it; continuing anyway."
   fi
   ask_parent_domain
-  NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
+  ask NOCODB_BASE_URL --nocodb-base-url "NocoDB public URL" "https://nocodb.$PARENT_DOMAIN"
   ask TOKEN_OFFICEPULSE --token-officepulse "NocoDB API token for officepulse"
-  NOCODB_TOKEN=${NOCODB_TOKEN:-$TOKEN_OFFICEPULSE}
+  ask_installer_token "$TOKEN_OFFICEPULSE"
   ensure_platformconfig
+  if (( SAVE_INSTALLER_TOKEN )); then env_write "$SELF_DIR/.env" NOCODB_INSTALLER_TOKEN "$NOCODB_TOKEN"; fi
   if ! has_database_password officepulse || ! has_database_password aida-admin-runtime; then
     die "Runtime database accounts are not configured: run 'install.sh database' or 'install.sh apps' first"
   fi
   seed_runtime_database_settings "${DB_HOST:-lsdb.$PARENT_DOMAIN}"
   clone_or_update OfficePulseAidaIntegration "$DIR/OfficePulseAidaIntegration"
-  local env_file=/etc/aida-integration/env
+  local env_file=$OFFICEPULSE_ENV_FILE
   log "$env_file"
   run mkdir -p "$(dirname "$env_file")"
   env_set "$env_file" NODE_ENV production
-  env_set "$env_file" NOCODB_BASE_URL "$NOCODB_BASE_URL"
-  env_set "$env_file" NOCODB_API_TOKEN "$TOKEN_OFFICEPULSE"
+  env_apply "$env_file" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  env_apply "$env_file" NOCODB_API_TOKEN "$TOKEN_OFFICEPULSE"
   note "Every other OfficePulse value is an officepulse/* row (its README lists them); the service reads them at start."
   if (( NO_DEPLOY )); then log "--no-deploy: stopping before its installer"; return 0; fi
   log "Running OfficePulse's own installer"
@@ -1070,7 +1306,7 @@ if [ -f "$SELF_DIR/compose.yaml" ] && [ -d "$SELF_DIR/echo" ]; then
   # to date and re-run, so an old install.sh cannot install the wrong thing;
   # one whose branch no longer exists at origin (promoted and deleted) moves
   # to origin's default branch first.
-  if [ "${INSTALL_UPDATED:-}" != 1 ] && [ -n "$current" ] && "${g[@]}" fetch -q --prune origin 2>/dev/null; then
+  if ! (( DRY )) && [ "${INSTALL_UPDATED:-}" != 1 ] && [ -n "$current" ] && "${g[@]}" fetch -q --prune origin 2>/dev/null; then
     if ! "${g[@]}" show-ref -q --verify "refs/remotes/origin/$current"; then
       default=$("${g[@]}" ls-remote --symref origin HEAD 2>/dev/null | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/", "", $2); print $2; exit}')
       [ -n "$default" ] || die "branch $current no longer exists at origin and its default branch could not be read; check out the right branch in $SELF_DIR and re-run"
@@ -1100,6 +1336,13 @@ if [ ! -f "$SELF_DIR/compose.yaml" ] || [ ! -d "$SELF_DIR/echo" ]; then
   exec "$DIR/AidaPlatformDB/install.sh" "${ARGS[@]}"
 fi
 (( DRY )) && log "Dry run: nothing below is applied"
+
+case $PHASE in
+  database|apps|officepulse|all)
+    load_saved_inputs
+    load_saved_platform_inputs
+    ;;
+esac
 
 case $PHASE in
   database) phase_database ;;
