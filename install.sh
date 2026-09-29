@@ -208,7 +208,7 @@ env_get() { # FILE KEY -> value, or nothing; never fails (set -e would end the s
 repo_branch() {
   local repo=$1
   if git ls-remote --exit-code --heads "$GIT_BASE/$repo.git" "$BRANCH" >/dev/null 2>&1; then printf '%s' "$BRANCH"; return; fi
-  local head; head=$(git ls-remote --symref "$GIT_BASE/$repo.git" HEAD 2>/dev/null | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}')
+  local head; head=$(git ls-remote --symref "$GIT_BASE/$repo.git" HEAD 2>/dev/null | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/", "", $2); print $2; exit}')
   note "$repo has no branch $BRANCH: using its default, ${head:-main}" >&2
   printf '%s' "${head:-main}"
 }
@@ -924,7 +924,7 @@ if [ -f "$SELF_DIR/compose.yaml" ] && [ -d "$SELF_DIR/echo" ]; then
   # to origin's default branch first.
   if [ "${INSTALL_UPDATED:-}" != 1 ] && [ -n "$current" ] && "${g[@]}" fetch -q --prune origin 2>/dev/null; then
     if ! "${g[@]}" show-ref -q --verify "refs/remotes/origin/$current"; then
-      default=$("${g[@]}" ls-remote --symref origin HEAD 2>/dev/null | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}')
+      default=$("${g[@]}" ls-remote --symref origin HEAD 2>/dev/null | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/", "", $2); print $2; exit}')
       [ -n "$default" ] || die "branch $current no longer exists at origin and its default branch could not be read; check out the right branch in $SELF_DIR and re-run"
       log "Branch $current no longer exists at origin: switching this checkout to $default and starting over"
       "${g[@]}" checkout -q "$default" 2>/dev/null || "${g[@]}" checkout -q -b "$default" "origin/$default"
