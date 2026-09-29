@@ -13,7 +13,9 @@
 # The data lives on the host, not in Docker: MySQL's data directory and
 # NocoDB's store are bind mounts under DATA_DIR (default /var/lib/aidaplatformdb),
 # where an operator can see, back up and restore them, and where no Compose
-# command can remove them. The networks are external because other stacks
+# command can remove them. create_host_path: false means Compose never creates
+# an empty directory either: install.sh makes them, and a start on a missing
+# one fails instead of bringing up an empty instance beside the real data. The networks are external because other stacks
 # share them. install.sh creates all of it; by hand:
 #   mkdir -p /var/lib/aidaplatformdb/mysql /var/lib/aidaplatformdb/nocodb
 #   docker network create --subnet 192.168.112.0/20 platform-local
@@ -46,7 +48,7 @@ services:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set in .env}
     volumes:
       - type: bind
-        source: /var/lib/aidaplatformdb/mysql
+        source: ${DATA_DIR:-/var/lib/aidaplatformdb}/mysql
         target: /var/lib/mysql
         bind:
           create_host_path: false
@@ -80,7 +82,7 @@ services:
       NC_AUTH_JWT_SECRET: ${NC_AUTH_JWT_SECRET:?set in .env}
     volumes:
       - type: bind
-        source: /var/lib/aidaplatformdb/nocodb
+        source: ${DATA_DIR:-/var/lib/aidaplatformdb}/nocodb
         target: /usr/app/data
         bind:
           create_host_path: false

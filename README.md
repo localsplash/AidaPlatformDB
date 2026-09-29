@@ -37,8 +37,11 @@ that checkout's parent.
 
 Every repository is taken from the branch the AidaPlatformDB checkout is on
 (`main` for the one-liner unless `--branch` says otherwise), so a `dev`
-checkout installs `dev` everywhere; the one-liner's URL should name the same
-branch.
+checkout installs `dev` everywhere; a repository that has no such branch is
+taken from its default branch, and the installer says so. The one-liner's URL
+should name the same branch. A checkout that is behind its branch updates
+itself and starts over, so a stale `install.sh` never runs. Passwords, secrets
+and tokens are typed without echo.
 Values not given as flags are asked for; `--yes` makes missing values an error
 instead. `--dry-run` prints what would happen. Re-running is safe: existing
 `.env` values, rows with a value and accounts are kept, and only what is missing
