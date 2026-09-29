@@ -1,1 +1,5 @@
 .env
+
+# Python installer contract tests
+__pycache__/
+*.py[cod]
