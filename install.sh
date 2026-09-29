@@ -771,10 +771,19 @@ phase_apps() {
   web_pw=$(row_get echo-web DB_PASSWORD); service_pw=$(row_get echo-service DB_PASSWORD)
   env_set "$echo_env" ECHO_WEB_DB_PASSWORD "${web_pw:-$(secret)}"
   env_set "$echo_env" ECHO_SERVICE_DB_PASSWORD "${service_pw:-$(secret)}"
-  env_set "$echo_env" ECHO_WEB_TAG '${ENVIRONMENT_NAME}-${ECHO_WEB_SHORT:-${BUILD_REVISION_SHORT-local}}'
-  env_set "$echo_env" ECHO_SERVICE_TAG '${ENVIRONMENT_NAME}-${ECHO_SERVICE_SHORT:-${BUILD_REVISION_SHORT-local}}'
-  env_set "$echo_env" ECHO_MEDIA_TAG '${ENVIRONMENT_NAME}-${ECHO_MEDIA_SHORT:-${BUILD_REVISION_SHORT-local}}'
-  env_set "$echo_env" ENVIRONMENT_NAME "$ENVIRONMENT_NAME"
+  # Image tags: <environment>-<commit>. The environment name is written
+  # literally — Compose resolves a .env reference only to variables defined
+  # above it in the file, and the applications read ENVIRONMENT_NAME from
+  # PlatformConfig, not from here. The *_SHORT stamps come from deploy.sh.
+  env_set "$echo_env" ECHO_WEB_TAG "$ENVIRONMENT_NAME"'-${ECHO_WEB_SHORT:-${BUILD_REVISION_SHORT-local}}'
+  env_set "$echo_env" ECHO_SERVICE_TAG "$ENVIRONMENT_NAME"'-${ECHO_SERVICE_SHORT:-${BUILD_REVISION_SHORT-local}}'
+  env_set "$echo_env" ECHO_MEDIA_TAG "$ENVIRONMENT_NAME"'-${ECHO_MEDIA_SHORT:-${BUILD_REVISION_SHORT-local}}'
+  # An earlier installer wrote the tags as ${ENVIRONMENT_NAME}-... with the
+  # variable defined below them, which Compose resolved to "-<commit>".
+  if [ -f "$echo_env" ] && grep -q '^ECHO_[A-Z]*_TAG=\${ENVIRONMENT_NAME}-' "$echo_env"; then
+    note "$echo_env: rewriting the image tags to $ENVIRONMENT_NAME-<commit> (Compose could not resolve \${ENVIRONMENT_NAME} there)"
+    run sed -i "s/^\(ECHO_[A-Z]*_TAG=\)\${ENVIRONMENT_NAME}-/\1$ENVIRONMENT_NAME-/; /^ENVIRONMENT_NAME=/d" "$echo_env"
+  fi
 
   log "PlatformConfig rows"
   # One shared secret for redeeming Identity handoff codes; Identity mints it if absent.
