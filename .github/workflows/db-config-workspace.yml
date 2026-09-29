@@ -1,0 +1,61 @@
+name: Verify database setup migration
+on:
+  push:
+    branches: [chore/standard-db-settings-20260929]
+    paths: [.github/workflows/db-config-workspace.yml]
+permissions:
+  contents: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - name: Apply integrity-checked installer edits
+        run: |
+          python - <<'PY'
+          import hashlib, runpy
+          from pathlib import Path
+          errors = []
+          for name, before, after, edits in runpy.run_path('.db-config-edits.py')['EDITS']:
+              path = Path(name)
+              old = path.read_text()
+              assert hashlib.sha256(old.encode()).hexdigest() == before, name
+              lines = old.splitlines(True)
+              for start, end, replacement in reversed(edits):
+                  lines[start:end] = [replacement]
+              new = ''.join(lines)
+              path.write_text(new)
+              actual = hashlib.sha256(new.encode()).hexdigest()
+              if actual != after:
+                  errors.append(name)
+                  print('Integrity mismatch:', name, actual, 'expected', after)
+              else:
+                  print('Verified:', name)
+          assert not errors, errors
+          PY
+          git diff --check
+      - name: Validate Bash and installer contracts
+        run: |
+          command -v jq openssl
+          bash -n install.sh
+          python3 -m unittest discover -s tests -v
+      - name: Publish validated work branch only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .gitignore README.md install.sh tests/test_database_settings.py
+          git commit -m 'refactor: seed scoped DB fields and migrate legacy database settings at setup'
+          git push origin HEAD:${{ github.ref_name }}
+          echo "VALIDATED_COMMIT=$(git rev-parse HEAD)"
+          echo "VALIDATED_TREE=$(git rev-parse HEAD^{tree})"
+      - name: Collect source diagnostics
+        if: failure()
+        run: tar --exclude=.git -czf "$RUNNER_TEMP/db-config-diagnostics.tgz" .
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: db-config-diagnostics
+          path: ${{ runner.temp }}/db-config-diagnostics.tgz
+          retention-days: 1
