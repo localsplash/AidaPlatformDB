@@ -342,10 +342,132 @@ row_set() {
 # and the parent would never see the row it created).
 ROW_VALUE=""
 row_default() {
-  ROW_VALUE=$(row_get "$1" "$2")
+  # Retain trailing newlines in literal passwords; command substitution alone loses them.
+  ROW_VALUE=$(row_get "$1" "$2"; printf '\001')
+  ROW_VALUE=${ROW_VALUE%$'\001'}
+  ROW_VALUE=${ROW_VALUE%$'\n'}
   if [ -n "$ROW_VALUE" ]; then note "row $1/$2 kept"; return; fi
   row_ensure "$@"
   ROW_VALUE=$3
+}
+
+
+# ── Canonical application database settings ─────────────────────────────────
+
+# Only the installer reads retired settings, to migrate existing credentials.
+# Applications never fall back to these names. Values in canonical rows win.
+db_decode() { # ENCODED OUTPUT_VAR; preserve literal %, quotes and trailing newlines
+  local encoded=$1 decoded='' prefix rest byte character
+  while [[ $encoded == *%* ]]; do
+    prefix=${encoded%%\%*}; rest=${encoded#*%}
+    [[ $rest =~ ^[0-9A-Fa-f]{2} ]] || die 'Legacy database setting has invalid percent encoding'
+    byte=${rest:0:2}; [[ $byte != 00 ]] || die 'Legacy database setting cannot contain NUL bytes'
+    printf -v character '%b' "\\x$byte"
+    decoded+="$prefix$character"; encoded=${rest:2}
+  done
+  printf -v "$2" '%s' "$decoded$encoded"
+}
+
+# Returns ROW_VALUE without dropping trailing newlines from a stored password.
+db_row_read() {
+  ROW_VALUE=$(row_get "$1" "$2"; printf '\001')
+  ROW_VALUE=${ROW_VALUE%$'\001'}; ROW_VALUE=${ROW_VALUE%$'\n'}
+}
+
+legacy_runtime_value() { # KEY -> ROW_VALUE, matching the former runtime scope order
+  local scope
+  for scope in officepulse aida '*'; do
+    db_row_read "$scope" "$1"
+    [ -z "$ROW_VALUE" ] || return 0
+  done
+}
+
+has_database_password() {
+  db_row_read "$1" DB_PASSWORD
+  [ -z "$ROW_VALUE" ] || return 0
+  case $1 in
+    aida-admin) db_row_read aida-admin AIDA_ADMIN_DATABASE_URL ;;
+    aida-admin-runtime) db_row_read aida-admin OFFICEPULSE_RUNTIME_DATABASE_URL ;;
+    officepulse) legacy_runtime_value RUNTIME_MYSQL_PASSWORD ;;
+  esac
+  [ -n "$ROW_VALUE" ]
+}
+
+aida_database_accounts_ready() {
+  has_database_password aida-admin && has_database_password officepulse && has_database_password aida-admin-runtime
+}
+
+# database_rows APP HOST NAME USER [LEGACY_APP LEGACY_URL_KEY]
+# DB_ROW_* and DB_ROW_ARGS carry the exact values used for both rows and grants.
+database_rows() {
+  local app=$1 host=$2 database=$3 user=$4 password='' db_port=3306 legacy='' key complete=1
+  for key in DB_HOST DB_NAME DB_USER DB_PASSWORD; do
+    db_row_read "$app" "$key"; [ -n "$ROW_VALUE" ] || complete=0
+  done
+  if ! (( complete )); then
+    if [ -n "${6:-}" ]; then db_row_read "$5" "$6"; legacy=$ROW_VALUE; fi
+    if [ -n "$legacy" ]; then
+      local re='^mysql://([^:@/?#]+):([^@/?#]*)@(\[[0-9A-Fa-f:.]+\]|[^:/?#]+)(:([0-9]+))?/([^/?#]+)$'
+      [[ $legacy =~ $re ]] || die "Legacy $5/$6 is invalid; set $app DB_* rows explicitly"
+      local parts=("${BASH_REMATCH[@]}")
+      db_decode "${parts[1]}" user; db_decode "${parts[2]}" password
+      [ -n "$password" ] || die "Legacy $5/$6 has no password; set $app/DB_PASSWORD explicitly"
+      host=${parts[3]}; host=${host#[}; host=${host%]}
+      db_port=${parts[5]:-3306}; database=${parts[6]}
+      note "Migrating $5/$6 into $app DB_* rows (existing canonical values are kept)"
+    elif [ "$app" = officepulse ]; then
+      legacy_runtime_value RUNTIME_MYSQL_HOST; host=${ROW_VALUE:-$host}
+      legacy_runtime_value RUNTIME_MYSQL_PORT; db_port=${ROW_VALUE:-$db_port}
+      legacy_runtime_value RUNTIME_MYSQL_DATABASE; database=${ROW_VALUE:-$database}
+      legacy_runtime_value RUNTIME_MYSQL_USER; user=${ROW_VALUE:-$user}
+      legacy_runtime_value RUNTIME_MYSQL_PASSWORD; password=$ROW_VALUE
+    fi
+  fi
+  row_default "$app" DB_HOST "$host" false 'MySQL hostname as this application reaches it; no connection URL is needed.'
+  DB_ROW_HOST=$ROW_VALUE
+  row_default "$app" DB_PORT "$db_port" false 'MySQL port (defaults to 3306).'
+  DB_ROW_PORT=$ROW_VALUE
+  row_default "$app" DB_NAME "$database" false 'Application database name.'
+  DB_ROW_NAME=$ROW_VALUE
+  row_default "$app" DB_USER "$user" false 'Application MySQL account, provisioned during platform setup.'
+  DB_ROW_USER=$ROW_VALUE
+  # Generate a password only when neither canonical nor migrated credentials exist.
+  db_row_read "$app" DB_PASSWORD
+  password=${ROW_VALUE:-${password:-$(secret)}}
+  row_default "$app" DB_PASSWORD "$password" true 'Literal MySQL password for DB_USER; provisioned from this same value. Never URL-encode it.'
+  DB_ROW_PASSWORD=$ROW_VALUE
+  DB_ROW_ARGS=(-e DB_HOST="$DB_ROW_HOST" -e DB_PORT="$DB_ROW_PORT" -e DB_NAME="$DB_ROW_NAME" -e DB_USER="$DB_ROW_USER" -e DB_PASSWORD="$DB_ROW_PASSWORD")
+}
+
+seed_runtime_database_settings() { # MySQL host as AidaAdmin reaches it
+  # OfficePulse runs on the PBX host, not on the platform Docker network.
+  database_rows officepulse "lsdb.$PARENT_DOMAIN" aidacalls_db aida_runtime
+  AIDA_RUNTIME_DB_ARGS=("${DB_ROW_ARGS[@]}")
+  AIDA_RUNTIME_DB_USER=$DB_ROW_USER
+  local runtime_name=$DB_ROW_NAME runtime_user=$DB_ROW_USER
+  database_rows aida-admin-runtime "$1" "$runtime_name" aidaadmin_ro aida-admin OFFICEPULSE_RUNTIME_DATABASE_URL
+  [ "$DB_ROW_NAME" = "$runtime_name" ] || die 'officepulse/DB_NAME and aida-admin-runtime/DB_NAME must match'
+  [ "$DB_ROW_USER" != "$runtime_user" ] || die 'OfficePulse and AidaAdmin runtime reader must use distinct DB_USER accounts'
+  AIDA_READER_DB_USER=$DB_ROW_USER
+  AIDA_READER_DB_ARGS=(-e READER_DB_NAME="$DB_ROW_NAME" -e READER_DB_USER="$DB_ROW_USER" -e READER_DB_PASSWORD="$DB_ROW_PASSWORD")
+}
+
+seed_aida_database_settings() {
+  database_rows aida-admin "$1" aida_admin_db aida_admin_app aida-admin AIDA_ADMIN_DATABASE_URL
+  AIDA_ADMIN_DB_ARGS=("${DB_ROW_ARGS[@]}")
+  local admin_user=$DB_ROW_USER
+  seed_runtime_database_settings "$1"
+  [[ $admin_user != "$AIDA_RUNTIME_DB_USER" && $admin_user != "$AIDA_READER_DB_USER" ]] || die "AidaAdmin store, runtime writer and runtime reader must use distinct DB_USER accounts"
+}
+
+provision_aida_databases() { # ADMIN_HOST ROOT_PASSWORD
+  # The DB_* input contract changed: fetch the selected branch scripts instead of
+  # accidentally invoking an older application checkout on the database host.
+  repo_script AidaAdmin "" db-users.sh "${AIDA_ADMIN_DB_ARGS[@]}" \
+    -e MYSQL_ADMIN_HOST="$1" -e MYSQL_ADMIN_PORT=3306 -e MYSQL_ADMIN_PASSWORD="$2"
+  repo_script OfficePulseAidaIntegration "" db-users.sh \
+    "${AIDA_RUNTIME_DB_ARGS[@]}" "${AIDA_READER_DB_ARGS[@]}" \
+    -e MYSQL_ADMIN_HOST="$1" -e MYSQL_ADMIN_PORT=3306 -e MYSQL_ADMIN_PASSWORD="$2"
 }
 
 # IPv4 CIDR arithmetic for merging trustedCIDR: an entry already inside an
@@ -441,9 +563,9 @@ database_accounts() {
   row_default identity DB_PASSWORD "$(secret)" true "Password for DB_USER; the same value identity/scripts/db-users.sh sets."
   repo_script identity "$DIR/identity" db-users.sh -e DB_HOST=platform-mysql-local -e DB_PASSWORD="$ROW_VALUE" -e MYSQL_ADMIN_PASSWORD="$root"
 
-  log "AidaAdmin: aida_admin_db and the aida_admin_app account"
-  row_default aida-admin AIDA_ADMIN_DATABASE_URL "mysql://aida_admin_app:$(secret)@$app_db_host:3306/aida_admin_db" true "AidaAdmin's own store (OAuth state, receipts, audit); the account is created by AidaAdmin/scripts/db-users.sh from this URL."
-  repo_script AidaAdmin "$DIR/aida/AidaAdmin" db-users.sh -e AIDA_ADMIN_DATABASE_URL="$ROW_VALUE" -e DB_HOST=platform-mysql-local -e MYSQL_ADMIN_PASSWORD="$root"
+  log "Aida databases: scoped DB_* rows and dedicated writer/reader accounts"
+  seed_aida_database_settings "$app_db_host"
+  provision_aida_databases platform-mysql-local "$root"
 
   log "Echo: echo_db schema, echo_web and echo_service, and echo_admin for its deploy-time jobs"
   row_ensure echo DB_NAME echo_db false "Echo application database; restart the pool after changes."
@@ -702,7 +824,8 @@ phase_apps() {
   # The database host created every account and left the passwords in the rows,
   # so nothing is asked here. Without those rows (a database host set up before
   # that step existed) the accounts are created from here with root instead.
-  local accounts_done=0 admin_user admin_pw
+  local accounts_done=0 aida_accounts_done=0 admin_user admin_pw
+  if aida_database_accounts_ready; then aida_accounts_done=1; fi
   admin_pw=$(row_get echo MYSQL_ADMIN_PASSWORD)
   if [ -n "$admin_pw" ]; then
     admin_user=$(row_get echo MYSQL_ADMIN_USER); admin_user=${admin_user:-echo_admin}; accounts_done=1
@@ -714,6 +837,14 @@ phase_apps() {
     ask MYSQL_ADMIN_PASSWORD --mysql-admin-password "MySQL root password on $DB_HOST"
     admin_pw=$MYSQL_ADMIN_PASSWORD
   fi
+
+  if ! (( aida_accounts_done )); then
+    if (( db_local )); then MYSQL_ADMIN_PASSWORD=${MYSQL_ADMIN_PASSWORD:-$(env_get "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD)}; fi
+    note "Aida database accounts need provisioning; use this host's MySQL root once, or run 'install.sh database' on the database host first."
+    ask MYSQL_ADMIN_PASSWORD --mysql-admin-password "MySQL root password on $DB_HOST"
+  fi
+  # Always migrate/seed rows, including upgrades where Echo's accounts already exist.
+  seed_aida_database_settings "$DB_HOST"
 
   log "External networks and volumes"
   ensure_proxy_network
@@ -787,7 +918,7 @@ phase_apps() {
 
   log "PlatformConfig rows"
   # One shared secret for redeeming Identity handoff codes; Identity mints it if absent.
-  local client_secret identity_db_password aida_admin_password aida_admin_url
+  local client_secret identity_db_password
   row_default identity IDENTITY_CLIENT_SECRET "$(secret)" true "Shared secret applications present at POST /api/token while IDENTITY_APP_AUTH_MODE is secret or dual."
   client_secret=$ROW_VALUE
   row_ensure echo-web IDENTITY_CLIENT_SECRET "$client_secret" true "Shared secret EchoWeb presents to Identity /api/token; same value as identity/IDENTITY_CLIENT_SECRET."
@@ -809,9 +940,6 @@ phase_apps() {
     row_ensure echo-web DB_PASSWORD "$(env_get "$echo_env" ECHO_WEB_DB_PASSWORD)" true "Same value as ECHO_WEB_DB_PASSWORD in the Echo environment's .env."
     row_ensure echo-service DB_USER echo_service false "EchoService's account, created by AidaPlatformDB/echo's db-users job."
     row_ensure echo-service DB_PASSWORD "$(env_get "$echo_env" ECHO_SERVICE_DB_PASSWORD)" true "Same value as ECHO_SERVICE_DB_PASSWORD in the Echo environment's .env."
-    aida_admin_password=$(secret)
-    row_default aida-admin AIDA_ADMIN_DATABASE_URL "mysql://aida_admin_app:$aida_admin_password@$DB_HOST:3306/aida_admin_db" true "AidaAdmin's own store (OAuth state, receipts, audit); the account is created by AidaAdmin/scripts/db-users.sh from this URL."
-    aida_admin_url=$ROW_VALUE
   fi
 
   # Everything else the applications need before their first start.
@@ -836,9 +964,11 @@ phase_apps() {
     log "MySQL accounts on $DB_HOST (fallback: created from here with root)"
     repo_script identity "$DIR/identity" db-users.sh \
       -e DB_HOST="$DB_HOST" -e DB_PASSWORD="$identity_db_password" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD"
-    repo_script AidaAdmin "$DIR/aida/AidaAdmin" db-users.sh \
-      -e AIDA_ADMIN_DATABASE_URL="$aida_admin_url" -e DB_HOST="$DB_HOST" -e MYSQL_ADMIN_PASSWORD="$MYSQL_ADMIN_PASSWORD"
     note "echo_web and echo_service are created by the Echo environment's own jobs at deploy"
+  fi
+  if ! (( aida_accounts_done )); then
+    log "Provisioning AidaAdmin, OfficePulse runtime, and the read-only runtime account"
+    provision_aida_databases "$DB_HOST" "$MYSQL_ADMIN_PASSWORD"
   fi
 
   if (( NO_DEPLOY )); then log "--no-deploy: stopping before build and start"; else
@@ -865,13 +995,19 @@ phase_apps() {
 
 phase_officepulse() {
   log "PBX host: OfficePulseAidaIntegration under $DIR"
-  prereqs git node npm rsync
+  prereqs git node npm rsync jq openssl curl
   if ! systemctl is-active --quiet asterisk 2>/dev/null; then
     note "Asterisk is not running on this host (systemctl is-active asterisk). OfficePulse needs it; continuing anyway."
   fi
   ask_parent_domain
   NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
   ask TOKEN_OFFICEPULSE --token-officepulse "NocoDB API token for officepulse"
+  NOCODB_TOKEN=${NOCODB_TOKEN:-$TOKEN_OFFICEPULSE}
+  ensure_platformconfig
+  if ! has_database_password officepulse || ! has_database_password aida-admin-runtime; then
+    die "Runtime database accounts are not configured: run 'install.sh database' or 'install.sh apps' first"
+  fi
+  seed_runtime_database_settings "${DB_HOST:-lsdb.$PARENT_DOMAIN}"
   clone_or_update OfficePulseAidaIntegration "$DIR/OfficePulseAidaIntegration"
   local env_file=/etc/aida-integration/env
   log "$env_file"
