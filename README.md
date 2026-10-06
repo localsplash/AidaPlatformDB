@@ -42,10 +42,13 @@ taken from its default branch, and the installer says so. The one-liner's URL
 should name the same branch. A checkout that is behind its branch updates
 itself and starts over, so a stale `install.sh` never runs. Passwords, secrets
 and tokens are typed without echo.
-Values not given as flags are asked for; `--yes` makes missing values an error
-instead. `--dry-run` prints what would happen. Re-running is safe: existing
-`.env` values, rows with a value and accounts are kept, and only what is missing
-is created.
+Values not given as flags are asked for, and every prompt defaults to what
+the host already has — the `.env` files a previous run wrote (secrets shown as
+`****` plus their last four characters) and the PlatformConfig rows — so on a
+re-run Enter keeps each value and typing replaces it. `--yes` takes those
+defaults and makes a missing value an error. `--dry-run` prints what would
+happen. Re-running is safe: generated secrets, rows with a value and accounts
+are kept, and only what is missing is created.
 
 ### a) The database host — `./install.sh database`
 

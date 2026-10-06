@@ -98,6 +98,9 @@ secret() { openssl rand -hex 32; }
 # Prompts read /dev/tty, so `curl | bash` — whose stdin is the script — works.
 # A password, secret or token is typed without echo: it must not end up in
 # the terminal's scrollback or in a pasted transcript.
+# What a prompt shows for a secret the environment already has.
+redacted() { local v=$1; if [ "${#v}" -gt 8 ]; then printf '****%s' "${v: -4}"; else printf '****'; fi; }
+
 ask() {
   local var=$1 flag=$2 prompt=$3 default=${4:-} value
   [ -n "${!var}" ] && return 0
@@ -106,7 +109,12 @@ ask() {
     die "$prompt: give it with $flag"
   fi
   if [[ $var =~ (PASSWORD|SECRET|TOKEN) ]]; then
-    read -rs -p "$prompt (not echoed): " value < /dev/tty; echo > /dev/tty
+    if [ -n "$default" ]; then
+      read -rs -p "$prompt [$(redacted "$default")] (Enter keeps it; typing is not echoed): " value < /dev/tty
+    else
+      read -rs -p "$prompt (not echoed): " value < /dev/tty
+    fi
+    echo > /dev/tty
   else
     read -r -p "$prompt${default:+ [$default]}: " value < /dev/tty
   fi
@@ -114,16 +122,24 @@ ask() {
   [ -n "${!var}" ] || die "$prompt is required"
 }
 
+# domain_of_nocodb URL: X.TLD when the URL is https://nocodb.X.TLD, else nothing —
+# how a re-run learns the platform's domain from a .env it wrote before.
+domain_of_nocodb() {
+  local u=${1#http://}; u=${u#https://}; u=${u%%/*}; u=${u%%:*}
+  [[ $u == nocodb.* ]] && printf '%s' "${u#nocodb.}" || true
+}
+
 # The apex domain. Defaults to this host's own domain (its FQDN minus the host
 # label), and anything that looks like a host name rather than an apex — the
 # FQDN itself, more than two labels, or a first label such as www or one of the
 # platform's own app names — is shown with the hostnames it would produce and
 # has to be confirmed or corrected. --yes accepts it with the warning.
-ask_parent_domain() {
+ask_parent_domain() { # [EXISTING: the domain a previous run recorded]
   local fqdn short default answer label
   fqdn=$(hostname -f 2>/dev/null | tr 'A-Z' 'a-z' || true)
   short=${fqdn%%.*}
-  default=$(hostname -d 2>/dev/null | tr 'A-Z' 'a-z' || true)
+  default=${1:-}
+  [ -n "$default" ] || default=$(hostname -d 2>/dev/null | tr 'A-Z' 'a-z' || true)
   while :; do
     ask PARENT_DOMAIN --parent-domain "Apex domain this platform lives under (X.TLD: the apps become identity.X.TLD, nocodb.X.TLD, ...)" "$default"
     PARENT_DOMAIN=$(printf '%s' "$PARENT_DOMAIN" | tr 'A-Z' 'a-z' | sed -E 's#^https?://##; s#/.*$##; s/\.$//')
@@ -192,6 +208,18 @@ env_set() {
   [ -f "$file" ] || { : > "$file"; chmod 600 "$file"; }
   if grep -qE "^${key}=.+" "$file"; then return; fi
   sed -i "/^${key}=\s*$/d" "$file"
+  printf '%s=%s\n' "$key" "$value" >> "$file"
+}
+
+# env_put FILE KEY VALUE: sets KEY to VALUE, replacing what was there — for a
+# value the operator just gave or the platform decided. env_set keeps what
+# exists (generated secrets).
+env_put() {
+  local file=$1 key=$2 value=$3
+  if (( DRY )); then echo "    + $file: $key=$([[ $key =~ (PASSWORD|SECRET|TOKEN) ]] && echo '<secret>' || echo "$value")"; return; fi
+  [ -f "$file" ] || { : > "$file"; chmod 600 "$file"; }
+  [ "$(env_get "$file" "$key")" = "$value" ] && return 0
+  sed -i "/^${key}=/d" "$file"
   printf '%s=%s\n' "$key" "$value" >> "$file"
 }
 
@@ -486,9 +514,9 @@ database_accounts() {
 phase_database() {
   log "Database host: MySQL and NocoDB from $SELF_DIR"
   prereqs docker git jq openssl curl
-  ask_parent_domain
-  ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" dev
-  NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
+  local existing_url; existing_url=$(env_get "$SELF_DIR/.env" NOCODB_BASE_URL)
+  ask_parent_domain "$(domain_of_nocodb "$existing_url")"
+  NOCODB_BASE_URL=${NOCODB_BASE_URL:-${existing_url:-https://nocodb.$PARENT_DOMAIN}}
   # Loopback serves applications on this host; other hosts need MySQL on an
   # address they can reach, and a name for it.
   if [ -z "$MYSQL_PUBLISH" ] && [ -z "$(env_get "$SELF_DIR/.env" MYSQL_PUBLISH)" ] && ! (( YES )) && { : < /dev/tty; } 2>/dev/null; then
@@ -506,11 +534,11 @@ phase_database() {
   ensure_dir "$data_dir/nocodb"
 
   log "$SELF_DIR/.env"
-  env_set "$SELF_DIR/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  env_put "$SELF_DIR/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
   env_set "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD "$(secret)"
   env_set "$SELF_DIR/.env" NC_AUTH_JWT_SECRET "$(secret)"
-  [ -n "$MYSQL_PUBLISH" ] && env_set "$SELF_DIR/.env" MYSQL_PUBLISH "$MYSQL_PUBLISH"
-  [ -n "$DATA_DIR" ] && env_set "$SELF_DIR/.env" DATA_DIR "$DATA_DIR"
+  [ -n "$MYSQL_PUBLISH" ] && env_put "$SELF_DIR/.env" MYSQL_PUBLISH "$MYSQL_PUBLISH"
+  [ -n "$DATA_DIR" ] && env_put "$SELF_DIR/.env" DATA_DIR "$DATA_DIR"
 
   local unmigrated; unmigrated=$(unmigrated_volumes "$data_dir")
   if [ -n "$unmigrated" ]; then
@@ -529,12 +557,24 @@ phase_database() {
   note "     created in, so it has to exist before the tokens do),"
   note "  2. in that base, create one API token per application: installer, identity,"
   note "     aida-admin, aida-agent, echo-web, echo-service, and officepulse if you run it."
-  if [ -z "$NOCODB_TOKEN" ] && { (( YES )) || [ ! -t 0 ]; }; then
+  # The installer's own token is kept in this host's .env, so a re-run only
+  # has to confirm it.
+  NOCODB_TOKEN=${NOCODB_TOKEN:-$(env_get "$SELF_DIR/.env" NOCODB_API_TOKEN)}
+  if [ -z "$NOCODB_TOKEN" ] && { (( YES )) || ! { : < /dev/tty; } 2>/dev/null; }; then
     note "No --nocodb-token: skipping the PlatformConfig rows. Re-run with a token to seed them."
   else
     ask NOCODB_TOKEN --nocodb-token "The installer token"
+    env_put "$SELF_DIR/.env" NOCODB_API_TOKEN "$NOCODB_TOKEN"
     log "PlatformConfig"
     ensure_platformconfig
+    local row_domain current_env; row_domain=$(row_get '*' PARENT_DOMAIN)
+    if [ -n "$row_domain" ] && [ "$row_domain" != "$PARENT_DOMAIN" ]; then
+      note "PlatformConfig has PARENT_DOMAIN=$row_domain; that row is the platform's answer and is used from here on"
+      PARENT_DOMAIN=$row_domain
+    fi
+    current_env=$(row_get '*' ENVIRONMENT_NAME)
+    ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" "${current_env:-dev}"
+    case $ENVIRONMENT_NAME in dev|staging|prod) ;; *) die "the environment name must be dev, staging or prod" ;; esac
     ask TRUSTED_CIDR --trusted-cidr "trustedCIDR: the networks the platform's servers sit on" "$(default_trusted_cidr)"
     row_ensure '*' PARENT_DOMAIN "$PARENT_DOMAIN" false "Apex domain (X.TLD) every application lives under; apps derive https://<app>.<PARENT_DOMAIN> from it."
     row_ensure '*' ENVIRONMENT_NAME "$ENVIRONMENT_NAME" false "dev, staging or prod; shown by the applications so nobody mistakes one environment for another."
@@ -669,18 +709,28 @@ phase_migrate_data() {
 phase_apps() {
   log "Application host: Identity, AidaAdmin, AidaAgent and the Echo environment under $DIR"
   prereqs docker git jq openssl curl
-  ask_parent_domain
-  ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" dev
-  NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
-  ask TOKEN_IDENTITY --token-identity "NocoDB API token for identity"
-  ask TOKEN_AIDA_ADMIN --token-aida-admin "NocoDB API token for aida-admin"
-  ask TOKEN_AIDA_AGENT --token-aida-agent "NocoDB API token for aida-agent"
-  ask TOKEN_ECHO_WEB --token-echo-web "NocoDB API token for echo-web"
-  ask TOKEN_ECHO_SERVICE --token-echo-service "NocoDB API token for echo-service"
+  # Every prompt defaults to what this host already has: the .env files a
+  # previous run wrote, then the PlatformConfig rows once the store is readable.
+  local existing_url; existing_url=$(env_get "$DIR/identity/.env" NOCODB_BASE_URL)
+  ask_parent_domain "$(domain_of_nocodb "$existing_url")"
+  NOCODB_BASE_URL=${NOCODB_BASE_URL:-${existing_url:-https://nocodb.$PARENT_DOMAIN}}
+  ask TOKEN_IDENTITY --token-identity "NocoDB API token for identity" "$(env_get "$DIR/identity/.env" NOCODB_API_TOKEN)"
+  ask TOKEN_AIDA_ADMIN --token-aida-admin "NocoDB API token for aida-admin" "$(env_get "$DIR/aida/AidaAdmin/.env" NOCODB_API_TOKEN)"
+  ask TOKEN_AIDA_AGENT --token-aida-agent "NocoDB API token for aida-agent" "$(env_get "$DIR/aida/AidaAgent/.env" NOCODB_API_TOKEN)"
+  ask TOKEN_ECHO_WEB --token-echo-web "NocoDB API token for echo-web" "$(env_get "$DIR/echo/.env" ECHO_WEB_NOCODB_API_TOKEN)"
+  ask TOKEN_ECHO_SERVICE --token-echo-service "NocoDB API token for echo-service" "$(env_get "$DIR/echo/.env" ECHO_SERVICE_NOCODB_API_TOKEN)"
   NOCODB_TOKEN=${NOCODB_TOKEN:-$TOKEN_IDENTITY}
 
   log "PlatformConfig"
   ensure_platformconfig
+  local row_domain current_env; row_domain=$(row_get '*' PARENT_DOMAIN)
+  if [ -n "$row_domain" ] && [ "$row_domain" != "$PARENT_DOMAIN" ]; then
+    note "PlatformConfig has PARENT_DOMAIN=$row_domain; that row is the platform's answer and is used from here on"
+    PARENT_DOMAIN=$row_domain
+  fi
+  current_env=$(row_get '*' ENVIRONMENT_NAME)
+  ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" "${current_env:-dev}"
+  case $ENVIRONMENT_NAME in dev|staging|prod) ;; *) die "the environment name must be dev, staging or prod" ;; esac
   row_ensure '*' PARENT_DOMAIN "$PARENT_DOMAIN" false "Apex domain (X.TLD) every application lives under; apps derive https://<app>.<PARENT_DOMAIN> from it."
   row_ensure '*' ENVIRONMENT_NAME "$ENVIRONMENT_NAME" false "dev, staging or prod; shown by the applications so nobody mistakes one environment for another."
   # trustedCIDR is platform-wide; the database host wrote its own networks, and
@@ -764,34 +814,36 @@ phase_apps() {
     fi
   done
 
-  log ".env files (existing values are kept)"
-  env_set "$DIR/identity/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
-  env_set "$DIR/identity/.env" NOCODB_API_TOKEN "$TOKEN_IDENTITY"
-  env_set "$DIR/aida/AidaAdmin/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
-  env_set "$DIR/aida/AidaAdmin/.env" NOCODB_API_TOKEN "$TOKEN_AIDA_ADMIN"
-  env_set "$DIR/aida/AidaAgent/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
-  env_set "$DIR/aida/AidaAgent/.env" NOCODB_API_TOKEN "$TOKEN_AIDA_AGENT"
+  log ".env files (what you answered replaces what was there; generated secrets are kept)"
+  env_put "$DIR/identity/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  env_put "$DIR/identity/.env" NOCODB_API_TOKEN "$TOKEN_IDENTITY"
+  env_put "$DIR/aida/AidaAdmin/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  env_put "$DIR/aida/AidaAdmin/.env" NOCODB_API_TOKEN "$TOKEN_AIDA_ADMIN"
+  env_put "$DIR/aida/AidaAgent/.env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  env_put "$DIR/aida/AidaAgent/.env" NOCODB_API_TOKEN "$TOKEN_AIDA_AGENT"
   local echo_env="$DIR/echo/.env"
-  env_set "$echo_env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
-  env_set "$echo_env" ECHO_WEB_NOCODB_API_TOKEN "$TOKEN_ECHO_WEB"
-  env_set "$echo_env" ECHO_SERVICE_NOCODB_API_TOKEN "$TOKEN_ECHO_SERVICE"
+  env_put "$echo_env" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  env_put "$echo_env" ECHO_WEB_NOCODB_API_TOKEN "$TOKEN_ECHO_WEB"
+  env_put "$echo_env" ECHO_SERVICE_NOCODB_API_TOKEN "$TOKEN_ECHO_SERVICE"
   env_set "$echo_env" ECHO_NETWORK "$ECHO_NETWORK"
   env_set "$echo_env" ECHO_MEDIA_VOLUME echo-media-data
   env_set "$echo_env" ECHO_SERVICE_LOGS_VOLUME echo-service-logs
-  env_set "$echo_env" ECHO_DB_HOST "$DB_HOST"
-  env_set "$echo_env" MYSQL_ADMIN_USER "$admin_user"
-  env_set "$echo_env" MYSQL_ADMIN_PASSWORD "$admin_pw"
+  env_put "$echo_env" ECHO_DB_HOST "$DB_HOST"
+  env_put "$echo_env" MYSQL_ADMIN_USER "$admin_user"
+  env_put "$echo_env" MYSQL_ADMIN_PASSWORD "$admin_pw"
+  # The application passwords are the rows' (the database host wrote them);
+  # without rows they are generated once here and kept.
   local web_pw service_pw
   web_pw=$(row_get echo-web DB_PASSWORD); service_pw=$(row_get echo-service DB_PASSWORD)
-  env_set "$echo_env" ECHO_WEB_DB_PASSWORD "${web_pw:-$(secret)}"
-  env_set "$echo_env" ECHO_SERVICE_DB_PASSWORD "${service_pw:-$(secret)}"
+  if [ -n "$web_pw" ]; then env_put "$echo_env" ECHO_WEB_DB_PASSWORD "$web_pw"; else env_set "$echo_env" ECHO_WEB_DB_PASSWORD "$(secret)"; fi
+  if [ -n "$service_pw" ]; then env_put "$echo_env" ECHO_SERVICE_DB_PASSWORD "$service_pw"; else env_set "$echo_env" ECHO_SERVICE_DB_PASSWORD "$(secret)"; fi
   # Image tags: <environment>-<commit>. The environment name is written
   # literally — Compose resolves a .env reference only to variables defined
   # above it in the file, and the applications read ENVIRONMENT_NAME from
   # PlatformConfig, not from here. The *_SHORT stamps come from deploy.sh.
-  env_set "$echo_env" ECHO_WEB_TAG "$ENVIRONMENT_NAME"'-${ECHO_WEB_SHORT:-${BUILD_REVISION_SHORT-local}}'
-  env_set "$echo_env" ECHO_SERVICE_TAG "$ENVIRONMENT_NAME"'-${ECHO_SERVICE_SHORT:-${BUILD_REVISION_SHORT-local}}'
-  env_set "$echo_env" ECHO_MEDIA_TAG "$ENVIRONMENT_NAME"'-${ECHO_MEDIA_SHORT:-${BUILD_REVISION_SHORT-local}}'
+  env_put "$echo_env" ECHO_WEB_TAG "$ENVIRONMENT_NAME"'-${ECHO_WEB_SHORT:-${BUILD_REVISION_SHORT-local}}'
+  env_put "$echo_env" ECHO_SERVICE_TAG "$ENVIRONMENT_NAME"'-${ECHO_SERVICE_SHORT:-${BUILD_REVISION_SHORT-local}}'
+  env_put "$echo_env" ECHO_MEDIA_TAG "$ENVIRONMENT_NAME"'-${ECHO_MEDIA_SHORT:-${BUILD_REVISION_SHORT-local}}'
   # An earlier installer wrote the tags as ${ENVIRONMENT_NAME}-... with the
   # variable defined below them, which Compose resolved to "-<commit>".
   if [ -f "$echo_env" ] && grep -q '^ECHO_[A-Z]*_TAG=\${ENVIRONMENT_NAME}-' "$echo_env"; then
@@ -883,9 +935,10 @@ phase_officepulse() {
   if ! systemctl is-active --quiet asterisk 2>/dev/null; then
     note "Asterisk is not running on this host (systemctl is-active asterisk). OfficePulse needs it; continuing anyway."
   fi
-  ask_parent_domain
-  NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
-  ask TOKEN_OFFICEPULSE --token-officepulse "NocoDB API token for officepulse"
+  local env_file=/etc/aida-integration/env existing_url; existing_url=$(env_get "$env_file" NOCODB_BASE_URL)
+  ask_parent_domain "$(domain_of_nocodb "$existing_url")"
+  NOCODB_BASE_URL=${NOCODB_BASE_URL:-${existing_url:-https://nocodb.$PARENT_DOMAIN}}
+  ask TOKEN_OFFICEPULSE --token-officepulse "NocoDB API token for officepulse" "$(env_get "$env_file" NOCODB_API_TOKEN)"
   NOCODB_TOKEN=${NOCODB_TOKEN:-$TOKEN_OFFICEPULSE}
   clone_or_update OfficePulseAidaIntegration "$DIR/OfficePulseAidaIntegration"
 
@@ -909,12 +962,11 @@ phase_officepulse() {
     note "  RUNTIME_MYSQL_* is the platform MySQL as reached from here (install.sh database wrote the"
     note "  password and, when MySQL is published, the host); MYSQL_* is this PBX's Asterisk realtime database."
   fi
-  local env_file=/etc/aida-integration/env
   log "$env_file"
   run mkdir -p "$(dirname "$env_file")"
   env_set "$env_file" NODE_ENV production
-  env_set "$env_file" NOCODB_BASE_URL "$NOCODB_BASE_URL"
-  env_set "$env_file" NOCODB_API_TOKEN "$TOKEN_OFFICEPULSE"
+  env_put "$env_file" NOCODB_BASE_URL "$NOCODB_BASE_URL"
+  env_put "$env_file" NOCODB_API_TOKEN "$TOKEN_OFFICEPULSE"
   note "Every other OfficePulse value is an officepulse/* row (its README lists them); the service reads them at start."
   if (( NO_DEPLOY )); then log "--no-deploy: stopping before its installer"; return 0; fi
   log "Running OfficePulse's own installer"
