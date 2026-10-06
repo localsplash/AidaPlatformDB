@@ -1206,9 +1206,16 @@ phase_apps() {
     provision_aida_databases "$DB_HOST" "$MYSQL_ADMIN_PASSWORD"
   fi
 
-  if (( NO_DEPLOY )); then log "--no-deploy: stopping before build and start"; else
+  if (( NO_DEPLOY )); then log "--no-deploy: stopping before build and start (AidaAdmin's NocoDB tables are created at deploy)"; else
     log "Building and starting"
     compose_up "$DIR/identity"
+    # AidaAdmin owns four tables in the PlatformConfig base (aida_tbl_*); its
+    # runtime never creates them. Its own bootstrap CLI, run from the image
+    # with the .env token, creates what is missing and adds missing columns —
+    # additive, so safe on every run — before the application starts.
+    log "AidaAdmin's NocoDB tables (nocodb upgrade, from its image)"
+    export_stamp "$DIR/aida/AidaAdmin"
+    run docker compose --project-directory "$DIR/aida/AidaAdmin" run --rm --no-deps aida-admin node server/dist/nocodb/cli.js upgrade
     compose_up "$DIR/aida/AidaAdmin"
     compose_up "$DIR/aida/AidaAgent"
     run "$DIR/echo/deploy.sh"
@@ -1244,6 +1251,12 @@ phase_officepulse() {
     die "Runtime database accounts are not configured: run 'install.sh database' or 'install.sh apps' first"
   fi
   seed_runtime_database_settings "${DB_HOST:-lsdb.$PARENT_DOMAIN}"
+  # What this host can derive for OfficePulse; the PBX-specific rows (its
+  # Asterisk realtime database, ARI, the LiveKit SIP host) are its operator's.
+  local env_name; env_name=$(row_get '*' ENVIRONMENT_NAME); env_name=${env_name:-${ENVIRONMENT_NAME:-dev}}
+  row_ensure officepulse OFFICEPULSE_INSTANCE_ID "officepulse-$env_name" false "PBX instance wire name (pbxInstanceId) this OfficePulse serves."
+  row_ensure officepulse OPS_PUBLIC_URL "https://officepulse-admin.$PARENT_DOMAIN" false "Public origin of the operations UI."
+  row_ensure officepulse OPS_API_URL "https://officepulse-api.$PARENT_DOMAIN" false "Public origin of the private API as the other applications call it."
   clone_or_update OfficePulseAidaIntegration "$DIR/OfficePulseAidaIntegration"
   local env_file=$OFFICEPULSE_ENV_FILE
   log "$env_file"
