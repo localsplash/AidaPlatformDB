@@ -75,7 +75,7 @@ as `lsdb.X.TLD`.
    `echo_db` (schema applied) with `echo_web`, `echo_service` and
    `echo_admin` — using each application's own `scripts/db-users.sh`, and
    writes the generated passwords to the rows the applications read
-   (`identity/DB_PASSWORD`, `aida-admin/AIDA_ADMIN_DATABASE_URL`,
+   (`identity/DB_PASSWORD`, `aida-admin/DB_PASSWORD`,
    `echo-web/DB_PASSWORD`, `echo-service/DB_PASSWORD`,
    `echo/MYSQL_ADMIN_PASSWORD`). `echo_admin` has all rights on `echo_db`
    and `CREATE USER`, nothing more: it is what the Echo environment's
@@ -127,7 +127,11 @@ apps then reach MySQL by container name).
    and webhook secrets, the public URLs derived from `PARENT_DOMAIN`
    (`https://identity.X.TLD`, `https://aida-admin.X.TLD`,
    `https://officepulse-api.X.TLD`) and the voice model defaults.
-5. Builds and starts everything, then prints the reverse-proxy hosts to create
+5. Builds and starts everything — including AidaAdmin's four NocoDB tables
+   (`aida_tbl_TenantProfile`, `aida_tbl_AssistantProfile`,
+   `aida_tbl_ProfileAssignment`, `aida_tbl_Appearance`), created with its own
+   `nocodb upgrade` from its image before it starts; the step is additive, so
+   re-running is safe — then prints the reverse-proxy hosts to create
    and what is still yours to fill in: Identity's OAuth provider credentials
    (`/setup` in a browser claims the instance), the `aida/LIVEKIT_*` rows, and
    carrier credentials.
@@ -171,3 +175,122 @@ Its settings are the `officepulse` rows (see that repository's README).
   new `echo/init/*.sql` files first ([echo/README.md](echo/README.md)).
 - Rotating a password: change the row (or Echo's `.env`) and re-run the
   owning `db-users.sh`; they converge.
+
+
+
+## Re-running the installer
+
+Run the same phase from the same checkout/install root. Existing settings are
+reviewed rather than requested from scratch:
+
+```sh
+./install.sh apps --branch dev
+./install.sh database --branch dev
+# On the PBX host:
+./install.sh officepulse --branch dev
+```
+
+Normal prompts show the current value in brackets. Press **Enter** to keep it,
+or type a replacement. Password/token prompts show only
+`[configured; Enter to keep, or type a replacement; not echoed]`.
+Neither the old secret nor the replacement is printed. Explicit flags and
+nonempty environment variables take precedence without an extra prompt.
+`--yes` uses saved values/defaults; an essential value with neither still fails.
+
+The installer discovers the existing application `.env` files under `--dir`,
+the platform `.env`, and OfficePulse's `/etc/aida-integration/env`. It reads these
+as data, never executes them. When the saved NocoDB endpoint is reachable,
+PlatformConfig supplies the current parent domain and environment name before
+prompting. Otherwise local hints are used, then reconciled against the real rows
+after NocoDB is available. The database phase stores its validated installer
+token as `NOCODB_INSTALLER_TOKEN` in the platform `.env`, not in PlatformConfig.
+`INSTALL_PARENT_DOMAIN` and `INSTALL_ENVIRONMENT_NAME` are offline hints only;
+the existing platform rows remain authoritative for defaults.
+
+Selected bootstrap replacements (such as an application API token or the public
+NocoDB URL) are actually written, rather than silently ignored because a file
+already exists. Changed files are replaced atomically with mode 600; unrelated
+entries and comments remain. Keeping a shared URL also keeps any existing
+per-application URL overrides. These bootstrap inputs are single-line values.
+
+Saved `DATA_DIR` and `MYSQL_PUBLISH` are reused and displayed on database-host
+reruns. Selecting a different data directory while the old one contains data
+fails before writing settings or starting containers; it is not a data migration.
+MySQL root/JWT secrets and existing application database credentials are kept,
+not rotated by this review. Scoped `DB_*` rows are displayed (passwords hidden)
+and preserved; `--db-host` supplies missing database coordinates, not a mass
+rewrite of already-provisioned per-app connections. Credential rotation, database
+moves, and a platform domain migration require their own coordinated changes.
+
+`--dry-run` masks complete secret values (including spaces/newlines), makes no
+settings writes, and skips the checkout's auto-update. `--no-deploy` still permits
+settings/account setup but stops before the application builds/restarts, as before.
+Neither option turns the database phase into an offline operation: that phase
+normally starts MySQL/NocoDB so it can perform setup; use `--dry-run` to preview it.
+
+Regression tests include real terminal prompts and reruns against temporary files
+and a fake settings API; no running deployment is used:
+
+```sh
+bash -n install.sh
+python3 -m unittest discover -s tests -v
+```
+
+
+## Aida database settings
+
+Database and app setup now seeds the same canonical setting keys in each
+connection's own PlatformConfig scope. `DB_PASSWORD` is marked secret and stored
+literally (not URL-encoded); `DB_PORT` is optional at runtime and defaults to 3306.
+
+| Scope (`app`) | `DB_NAME` | `DB_USER` | Purpose |
+| --- | --- | --- | --- |
+| `aida-admin` | `aida_admin_db` | `aida_admin_app` | Admin's writable OAuth state, event receipts and audit store |
+| `officepulse` | `aidacalls_db` | `aida_runtime` | Runtime writer and schema migrations |
+| `aida-admin-runtime` | `aidacalls_db` | `aidaadmin_ro` | Admin's SELECT-only view of runtime state |
+
+Every scope also has `DB_HOST`, `DB_PORT`, and `DB_PASSWORD`. The installer uses
+AidaAdmin's and OfficePulse's own `scripts/db-users.sh` implementations to create
+the databases/accounts and grant the appropriate access. AidaAgent has no SQL
+connection and receives no database credentials. Database settings must not be
+placed in `aida` or `*`, where another application could inherit them.
+
+The application-host connection defaults to `platform-mysql-local` when local,
+or `lsdb.<PARENT_DOMAIN>` when remote. OfficePulse runs on the PBX host, so its
+host defaults to `lsdb.<PARENT_DOMAIN>`, never the platform-only Docker name.
+Preserved per-app host/port values may describe an existing SSH tunnel. Those
+network paths must reach the same physical runtime database; the installer does
+not create tunnels or change firewall policy. `MYSQL_ADMIN_HOST` and
+`MYSQL_ADMIN_PORT` are provisioning-only overrides for the operator's path.
+
+### Upgrading existing settings
+
+Run setup with the updated `dev` checkouts before restarting the applications:
+
+```sh
+./install.sh apps --branch dev
+# On a new installation, run the database phase first as usual:
+# ./install.sh database --branch dev
+```
+
+Only the installer's migration code recognizes the retired
+`AIDA_ADMIN_DATABASE_URL`, `OFFICEPULSE_RUNTIME_DATABASE_URL`, and
+`RUNTIME_MYSQL_*` rows. It copies their host, port, schema, username and password
+into the appropriate `DB_*` rows. Percent-encoded URL credentials are decoded
+once; literal canonical passwords, including punctuation/newlines, are preserved.
+Nonblank canonical rows take precedence. Re-running is idempotent and does not
+rotate existing passwords. Retired rows are left intact for rollback and may be
+removed after the updated applications start; no application requires them.
+
+When account credentials are missing, app setup requests MySQL root once to
+provision the missing accounts. Echo's existing account rows no longer suppress
+Aida account setup. An already-provisioned installation only needs row migration.
+The PBX-host phase verifies the runtime accounts exist and migrates their rows
+before running OfficePulse's installer. It does not invent database credentials
+for an unprovisioned server.
+
+Installer regression tests use a fake settings store, without Docker or MySQL:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
