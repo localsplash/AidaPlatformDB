@@ -1251,6 +1251,12 @@ phase_officepulse() {
     die "Runtime database accounts are not configured: run 'install.sh database' or 'install.sh apps' first"
   fi
   seed_runtime_database_settings "${DB_HOST:-lsdb.$PARENT_DOMAIN}"
+  # What this host can derive for OfficePulse; the PBX-specific rows (its
+  # Asterisk realtime database, ARI, the LiveKit SIP host) are its operator's.
+  local env_name; env_name=$(row_get '*' ENVIRONMENT_NAME); env_name=${env_name:-${ENVIRONMENT_NAME:-dev}}
+  row_ensure officepulse OFFICEPULSE_INSTANCE_ID "officepulse-$env_name" false "PBX instance wire name (pbxInstanceId) this OfficePulse serves."
+  row_ensure officepulse OPS_PUBLIC_URL "https://officepulse-admin.$PARENT_DOMAIN" false "Public origin of the operations UI."
+  row_ensure officepulse OPS_API_URL "https://officepulse-api.$PARENT_DOMAIN" false "Public origin of the private API as the other applications call it."
   clone_or_update OfficePulseAidaIntegration "$DIR/OfficePulseAidaIntegration"
   local env_file=$OFFICEPULSE_ENV_FILE
   log "$env_file"
