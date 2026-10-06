@@ -465,6 +465,20 @@ database_accounts() {
   local admin_pw=$ROW_VALUE
   note "echo_admin"
   run "${client[@]}" mysql:8.4 mysql -h platform-mysql-local -uroot -e "CREATE USER IF NOT EXISTS 'echo_admin'@'%' IDENTIFIED BY '$admin_pw'; ALTER USER 'echo_admin'@'%' IDENTIFIED BY '$admin_pw'; GRANT ALL PRIVILEGES ON \`echo\\_db\`.* TO 'echo_admin'@'%' WITH GRANT OPTION; GRANT CREATE USER ON *.* TO 'echo_admin'@'%';"
+
+  log "OfficePulse: aidacalls_db, its aida_runtime account, and AidaAdmin's read-only aidaadmin_ro"
+  # OfficePulse owns the runtime database and both accounts; AidaAdmin only
+  # reads it, through the URL row, and refuses to start in production without
+  # that row. RUNTIME_MYSQL_HOST is how the PBX host reaches MySQL: the
+  # published name when there is one, otherwise the operator's (dev tunnels).
+  row_ensure officepulse RUNTIME_MYSQL_USER aida_runtime false "OfficePulse's account on aidacalls_db (DML and its own migrations); created by OfficePulseAidaIntegration/scripts/db-users.sh."
+  row_ensure officepulse RUNTIME_MYSQL_DATABASE aidacalls_db false "OfficePulse's runtime database (calls, devices, receipts) on the platform MySQL."
+  [ -n "$publish" ] && row_ensure officepulse RUNTIME_MYSQL_HOST "$app_db_host" false "The platform MySQL as the PBX host reaches it (RUNTIME_MYSQL_PORT when not 3306)."
+  row_default officepulse RUNTIME_MYSQL_PASSWORD "$(secret)" true "Password for RUNTIME_MYSQL_USER; the same value OfficePulseAidaIntegration/scripts/db-users.sh sets."
+  local runtime_pw=$ROW_VALUE
+  row_default aida-admin OFFICEPULSE_RUNTIME_DATABASE_URL "mysql://aidaadmin_ro:$(secret)@$app_db_host:3306/aidacalls_db" true "AidaAdmin's read-only view of OfficePulse's aidacalls_db (SELECT only); the account is created by OfficePulseAidaIntegration/scripts/db-users.sh from this URL."
+  repo_script OfficePulseAidaIntegration "$DIR/OfficePulseAidaIntegration" db-users.sh \
+    -e DB_HOST=platform-mysql-local -e RUNTIME_MYSQL_PASSWORD="$runtime_pw" -e OFFICEPULSE_RUNTIME_DATABASE_URL="$ROW_VALUE" -e MYSQL_ADMIN_PASSWORD="$root"
 }
 
 # ── Phase a: the database host ───────────────────────────────────────────────
@@ -872,7 +886,29 @@ phase_officepulse() {
   ask_parent_domain
   NOCODB_BASE_URL=${NOCODB_BASE_URL:-https://nocodb.$PARENT_DOMAIN}
   ask TOKEN_OFFICEPULSE --token-officepulse "NocoDB API token for officepulse"
+  NOCODB_TOKEN=${NOCODB_TOKEN:-$TOKEN_OFFICEPULSE}
   clone_or_update OfficePulseAidaIntegration "$DIR/OfficePulseAidaIntegration"
+
+  log "PlatformConfig rows (officepulse scope)"
+  ensure_platformconfig
+  local current_env; current_env=$(row_get '*' ENVIRONMENT_NAME)
+  ask ENVIRONMENT_NAME --environment-name "Environment name (dev, staging, prod)" "${current_env:-dev}"
+  row_ensure officepulse OFFICEPULSE_INSTANCE_ID "officepulse-$ENVIRONMENT_NAME" false "PBX instance wire name (pbxInstanceId) this OfficePulse serves."
+  row_ensure officepulse OPS_PUBLIC_URL "https://officepulse-admin.$PARENT_DOMAIN" false "Public origin of the operations UI."
+  row_ensure officepulse OPS_API_URL "https://officepulse-api.$PARENT_DOMAIN" false "Public origin of the private API as the other applications call it."
+  local key still=()
+  for key in RUNTIME_MYSQL_HOST RUNTIME_MYSQL_PASSWORD MYSQL_HOST MYSQL_DATABASE ARI_URL ARI_USERNAME ARI_PASSWORD LIVEKIT_SIP_HOST; do
+    [ -n "$(row_get officepulse "$key")" ] || still+=("officepulse/$key")
+  done
+  for key in LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET LIVEKIT_AGENT_NAME; do
+    [ -n "$(row_get aida "$key")" ] || still+=("aida/$key")
+  done
+  if [ "${#still[@]}" -gt 0 ]; then
+    note "Rows OfficePulse needs that only this host's operator can fill in (its README lists the rest):"
+    note "  ${still[*]}"
+    note "  RUNTIME_MYSQL_* is the platform MySQL as reached from here (install.sh database wrote the"
+    note "  password and, when MySQL is published, the host); MYSQL_* is this PBX's Asterisk realtime database."
+  fi
   local env_file=/etc/aida-integration/env
   log "$env_file"
   run mkdir -p "$(dirname "$env_file")"

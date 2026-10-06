@@ -71,13 +71,16 @@ as `lsdb.X.TLD`.
    (found by name; nothing is recreated) and seeds the global rows:
    `ENVIRONMENT_NAME`, `PARENT_DOMAIN`, `trustedCIDR`.
 4. Creates every application's database and MySQL account here, where root
-   is — `platform_db`/`identity`, `aida_admin_db`/`aida_admin_app`, and
+   is — `platform_db`/`identity`, `aida_admin_db`/`aida_admin_app`,
    `echo_db` (schema applied) with `echo_web`, `echo_service` and
-   `echo_admin` — using each application's own `scripts/db-users.sh`, and
-   writes the generated passwords to the rows the applications read
-   (`identity/DB_PASSWORD`, `aida-admin/AIDA_ADMIN_DATABASE_URL`,
-   `echo-web/DB_PASSWORD`, `echo-service/DB_PASSWORD`,
-   `echo/MYSQL_ADMIN_PASSWORD`). `echo_admin` has all rights on `echo_db`
+   `echo_admin`, and OfficePulse's `aidacalls_db` with `aida_runtime` and the
+   read-only `aidaadmin_ro` — using each application's own
+   `scripts/db-users.sh`, and writes the generated passwords to the rows the
+   applications read (`identity/DB_PASSWORD`,
+   `aida-admin/AIDA_ADMIN_DATABASE_URL`, `echo-web/DB_PASSWORD`,
+   `echo-service/DB_PASSWORD`, `echo/MYSQL_ADMIN_PASSWORD`,
+   `officepulse/RUNTIME_MYSQL_PASSWORD`,
+   `aida-admin/OFFICEPULSE_RUNTIME_DATABASE_URL`). `echo_admin` has all rights on `echo_db`
    and `CREATE USER`, nothing more: it is what the Echo environment's
    deploy-time migration and account jobs run as, so the MySQL root password
    never leaves this host.
@@ -136,8 +139,12 @@ apps then reach MySQL by container name).
 
 Requires Asterisk running on that host and Node 22. Clones
 `OfficePulseAidaIntegration`, writes its `/etc/aida-integration/env`
-(`NOCODB_BASE_URL`, `NOCODB_API_TOKEN`) and runs its own `scripts/install.sh`.
-Its settings are the `officepulse` rows (see that repository's README).
+(`NOCODB_BASE_URL`, `NOCODB_API_TOKEN`), seeds the `officepulse` rows it can
+derive (`OFFICEPULSE_INSTANCE_ID`, `OPS_PUBLIC_URL`, `OPS_API_URL`), lists the
+ones only this host's operator knows (its Asterisk realtime database, ARI,
+how it reaches the platform MySQL, the LiveKit SIP host — see that
+repository's README) and runs its own `scripts/install.sh`. Its database
+and accounts were created by the database host.
 
 ## Day-to-day
 
