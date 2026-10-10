@@ -469,7 +469,7 @@ ensure_platformconfig() {
     tables=$(nc "/api/v2/meta/bases/$base_id/tables" 2>/dev/null) || return 0
     TABLE_ID=$(jq -r --arg t "$TABLE_NAME" '[.list[] | select(.title==$t)] | .[0].id // ""' <<<"$tables")
     [ -n "$TABLE_ID" ] || { note "would create table $TABLE_NAME"; TABLE_ID=dry; return; }
-    rows_load; note "base $BASE_NAME and table $TABLE_NAME found ($(jq length <<<"$ROWS_JSON") rows)"; TABLE_ID=dry; return
+    rows_load; note "base $BASE_NAME and table $TABLE_NAME found ($(jq length <<<"$ROWS_JSON") rows)"; TABLE_ID=dry; rename_settings_scopes; return
   fi
   bases=$(nc /api/v2/meta/bases) || die "NocoDB at ${NOCODB_API_URL:-$NOCODB_BASE_URL} did not answer or rejected the token"
   base_id=$(jq -r --arg t "$BASE_NAME" '[.list[] | select(.title==$t)] | if length==1 then .[0].id elif length==0 then "" else "dup" end' <<<"$bases")
@@ -503,6 +503,7 @@ ensure_platformconfig() {
     note "table $TABLE_NAME found"
   fi
   rows_load
+  rename_settings_scopes
 }
 
 rows_load() {
@@ -517,6 +518,32 @@ rows_load() {
     [ "$count" -lt 200 ] && break
     offset=$((offset + 200))
   done
+}
+
+# Scopes renamed in place, so every application reads its rows under the new
+# name without re-entering a value. The bridge between OfficePulse's Asterisk
+# and Aida's LiveKit agent is aida-pbx; AidaAdmin's read-only view of its
+# database is aida-pbx-reader.
+RENAMED_SCOPES=("officepulse aida-pbx" "aida-admin-runtime aida-pbx-reader")
+
+rename_settings_scopes() {
+  local pair old new ids key
+  for pair in "${RENAMED_SCOPES[@]}"; do
+    read -r old new <<<"$pair"
+    ids=$(jq -r --arg o "$old" '[.[] | select(.app==$o) | .Id] | join(" ")' <<<"$ROWS_JSON")
+    [ -n "$ids" ] || continue
+    # A key present under both names is a person's call, not the installer's.
+    key=$(jq -r --arg o "$old" --arg n "$new" '
+      [.[] | select(.app==$n) | .settingKey] as $kept
+      | [.[] | select(.app==$o and (.settingKey as $k | $kept | index($k))) | .settingKey] | .[0] // ""' <<<"$ROWS_JSON")
+    [ -z "$key" ] || die "PlatformConfig has both $old/$key and $new/$key: $old was renamed $new, so delete the row you do not want and re-run"
+    note "PlatformConfig scope $old renamed $new ($(wc -w <<<"$ids") rows)"
+    if (( DRY )) || [ "$TABLE_ID" = dry ]; then continue; fi
+    nc "/api/v2/tables/$TABLE_ID/records" -X PATCH \
+      --data "$(jq -n --arg n "$new" --arg ids "$ids" '$ids | split(" ") | map({Id: tonumber, app: $n})')" >/dev/null ||
+      die "could not rename PlatformConfig scope $old to $new"
+  done
+  if ! (( DRY )) && [ "$TABLE_ID" != dry ]; then rows_load; fi
 }
 
 row_get() { # APP KEY -> value ('' when absent or blank)
@@ -597,7 +624,7 @@ db_row_read() {
 
 legacy_runtime_value() { # KEY -> ROW_VALUE, matching the former runtime scope order
   local scope
-  for scope in officepulse aida '*'; do
+  for scope in aida-pbx aida '*'; do
     db_row_read "$scope" "$1"
     [ -z "$ROW_VALUE" ] || return 0
   done
@@ -608,14 +635,14 @@ has_database_password() {
   [ -z "$ROW_VALUE" ] || return 0
   case $1 in
     aida-admin) db_row_read aida-admin AIDA_ADMIN_DATABASE_URL ;;
-    aida-admin-runtime) db_row_read aida-admin OFFICEPULSE_RUNTIME_DATABASE_URL ;;
-    officepulse) legacy_runtime_value RUNTIME_MYSQL_PASSWORD ;;
+    aida-pbx-reader) db_row_read aida-admin OFFICEPULSE_RUNTIME_DATABASE_URL ;;
+    aida-pbx) legacy_runtime_value RUNTIME_MYSQL_PASSWORD ;;
   esac
   [ -n "$ROW_VALUE" ]
 }
 
 aida_database_accounts_ready() {
-  has_database_password aida-admin && has_database_password officepulse && has_database_password aida-admin-runtime
+  has_database_password aida-admin && has_database_password aida-pbx && has_database_password aida-pbx-reader
 }
 
 # database_rows APP HOST NAME USER [LEGACY_APP LEGACY_URL_KEY]
@@ -636,7 +663,7 @@ database_rows() {
       host=${parts[3]}; host=${host#[}; host=${host%]}
       db_port=${parts[5]:-3306}; database=${parts[6]}
       note "Migrating $5/$6 into $app DB_* rows (existing canonical values are kept)"
-    elif [ "$app" = officepulse ]; then
+    elif [ "$app" = aida-pbx ]; then
       legacy_runtime_value RUNTIME_MYSQL_HOST; host=${ROW_VALUE:-$host}
       legacy_runtime_value RUNTIME_MYSQL_PORT; db_port=${ROW_VALUE:-$db_port}
       legacy_runtime_value RUNTIME_MYSQL_DATABASE; database=${ROW_VALUE:-$database}
@@ -662,12 +689,12 @@ database_rows() {
 
 seed_runtime_database_settings() { # MySQL host as AidaAdmin reaches it
   # OfficePulse runs on the PBX host, not on the platform Docker network.
-  database_rows officepulse "lsdb.$PARENT_DOMAIN" aidacalls_db aida_runtime
+  database_rows aida-pbx "lsdb.$PARENT_DOMAIN" aidacalls_db aida_runtime
   AIDA_RUNTIME_DB_ARGS=("${DB_ROW_ARGS[@]}")
   AIDA_RUNTIME_DB_USER=$DB_ROW_USER
   local runtime_name=$DB_ROW_NAME runtime_user=$DB_ROW_USER
-  database_rows aida-admin-runtime "$1" "$runtime_name" aidaadmin_ro aida-admin OFFICEPULSE_RUNTIME_DATABASE_URL
-  [ "$DB_ROW_NAME" = "$runtime_name" ] || die 'officepulse/DB_NAME and aida-admin-runtime/DB_NAME must match'
+  database_rows aida-pbx-reader "$1" "$runtime_name" aidaadmin_ro aida-admin OFFICEPULSE_RUNTIME_DATABASE_URL
+  [ "$DB_ROW_NAME" = "$runtime_name" ] || die 'aida-pbx/DB_NAME and aida-pbx-reader/DB_NAME must match'
   [ "$DB_ROW_USER" != "$runtime_user" ] || die 'OfficePulse and AidaAdmin runtime reader must use distinct DB_USER accounts'
   AIDA_READER_DB_USER=$DB_ROW_USER
   AIDA_READER_DB_ARGS=(-e READER_DB_NAME="$DB_ROW_NAME" -e READER_DB_USER="$DB_ROW_USER" -e READER_DB_PASSWORD="$DB_ROW_PASSWORD")
@@ -1185,7 +1212,7 @@ phase_apps() {
   done
   row_ensure aida-admin SESSION_SECRET "$(secret)" true "Cookie-signing secret for AidaAdmin's own browser sessions."
   row_ensure aida-admin PUBLIC_BASE_URL "https://aida-admin.$PARENT_DOMAIN" false "Public origin of AidaAdmin; builds the OAuth redirect_uri and the /id/events webhook URL."
-  row_ensure aida-admin ID_BASE_URL "https://identity.$PARENT_DOMAIN" false "Identity's public origin as AidaAdmin calls it. Scoped to aida-admin on purpose: OfficePulse refuses this key in *, aida and officepulse."
+  row_ensure aida-admin ID_BASE_URL "https://identity.$PARENT_DOMAIN" false "Identity's public origin as AidaAdmin calls it. Scoped to aida-admin on purpose: OfficePulse refuses this key in *, aida and aida-pbx."
   row_ensure aida-admin ID_TRUSTED_PROXY_CIDRS "$(proxy_subnet)" false "Reverse proxies whose X-Forwarded-For AidaAdmin believes (the proxy's Docker network)."
   row_ensure aida OFFICEPULSE_API_BASE_URL "https://officepulse-api.$PARENT_DOMAIN" false "OfficePulse's private API origin: AidaAdmin's orchestration calls and AidaAgent's call bootstrap."
   row_ensure aida AIDA_ROUTE_TOKEN_ATTRIBUTE sip.aidaRouteToken false "LiveKit SIP trunk attribute the X-Aida-Route-Token header is mapped to; read by OfficePulse and AidaAgent."
@@ -1247,16 +1274,16 @@ phase_officepulse() {
   ask_installer_token "$TOKEN_OFFICEPULSE"
   ensure_platformconfig
   if (( SAVE_INSTALLER_TOKEN )); then env_write "$SELF_DIR/.env" NOCODB_INSTALLER_TOKEN "$NOCODB_TOKEN"; fi
-  if ! has_database_password officepulse || ! has_database_password aida-admin-runtime; then
+  if ! has_database_password aida-pbx || ! has_database_password aida-pbx-reader; then
     die "Runtime database accounts are not configured: run 'install.sh database' or 'install.sh apps' first"
   fi
   seed_runtime_database_settings "${DB_HOST:-lsdb.$PARENT_DOMAIN}"
   # What this host can derive for OfficePulse; the PBX-specific rows (its
   # Asterisk realtime database, ARI, the LiveKit SIP host) are its operator's.
   local env_name; env_name=$(row_get '*' ENVIRONMENT_NAME); env_name=${env_name:-${ENVIRONMENT_NAME:-dev}}
-  row_ensure officepulse OFFICEPULSE_INSTANCE_ID "officepulse-$env_name" false "PBX instance wire name (pbxInstanceId) this OfficePulse serves."
-  row_ensure officepulse OPS_PUBLIC_URL "https://officepulse-admin.$PARENT_DOMAIN" false "Public origin of the operations UI."
-  row_ensure officepulse OPS_API_URL "https://officepulse-api.$PARENT_DOMAIN" false "Public origin of the private API as the other applications call it."
+  row_ensure aida-pbx OFFICEPULSE_INSTANCE_ID "officepulse-$env_name" false "PBX instance wire name (pbxInstanceId) this OfficePulse serves."
+  row_ensure aida-pbx OPS_PUBLIC_URL "https://officepulse-admin.$PARENT_DOMAIN" false "Public origin of the operations UI."
+  row_ensure aida-pbx OPS_API_URL "https://officepulse-api.$PARENT_DOMAIN" false "Public origin of the private API as the other applications call it."
   clone_or_update OfficePulseAidaIntegration "$DIR/OfficePulseAidaIntegration"
   local env_file=$OFFICEPULSE_ENV_FILE
   log "$env_file"
@@ -1264,7 +1291,7 @@ phase_officepulse() {
   env_set "$env_file" NODE_ENV production
   env_apply "$env_file" NOCODB_BASE_URL "$NOCODB_BASE_URL"
   env_apply "$env_file" NOCODB_API_TOKEN "$TOKEN_OFFICEPULSE"
-  note "Every other OfficePulse value is an officepulse/* row (its README lists them); the service reads them at start."
+  note "Every other OfficePulse value is an aida-pbx/* row (its README lists them); the service reads them at start."
   if (( NO_DEPLOY )); then log "--no-deploy: stopping before its installer"; return 0; fi
   log "Running OfficePulse's own installer"
   run "$DIR/OfficePulseAidaIntegration/scripts/install.sh"
