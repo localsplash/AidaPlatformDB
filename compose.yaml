@@ -3,7 +3,7 @@
 # applications may live on the same host or on others.
 #
 #   MySQL  (platform-mysql-local)  echo_db (Echo), platform_db (Identity),
-#          aida_admin_db (AidaAdmin) and aidacalls_db (OfficePulse runtime).
+#          aida_admin_db (AidaAdmin) and aida_pbx_db (AidaPbx runtime).
 #          Published on 127.0.0.1:3306 unless MYSQL_PUBLISH says otherwise;
 #          other hosts reach it as lsdb.X.TLD or through a tunnel.
 #   NocoDB (platform-nocodb-local) the PlatformConfig base whose cfg_tbl_Setting

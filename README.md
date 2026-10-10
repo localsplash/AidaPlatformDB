@@ -247,7 +247,7 @@ literally (not URL-encoded); `DB_PORT` is optional at runtime and defaults to 33
 | Scope (`app`) | `DB_NAME` | `DB_USER` | Purpose |
 | --- | --- | --- | --- |
 | `aida-admin` | `aida_admin_db` | `aida_admin_app` | Admin's writable OAuth state, event receipts and audit store |
-| `aida-pbx` | `aidacalls_db` | `aida_runtime` | Runtime writer and schema migrations |
+| `aida-pbx` | `aida_pbx_db` | `aida_pbx_app` | Runtime writer and schema migrations |
 
 `aida-pbx` is the bridge between OfficePulse's Asterisk and Aida's LiveKit agent
 (the AidaPbx service, formerly OfficePulseAidaIntegration); it was called `officepulse`. Every
@@ -256,9 +256,26 @@ place, keeping their values; a key present under both names stops the run until
 one row is deleted.
 
 AidaAdmin reads runtime state through OfficePulse's private API, so it has no
-login on `aidacalls_db`. Rows left under the retired `aida-admin-runtime` scope
+login on its database. Rows left under the retired `aida-admin-runtime` scope
 are reported, not deleted: remove them in NocoDB and drop the `aidaadmin_ro`
 MySQL user (`DROP USER IF EXISTS 'aidaadmin_ro'@'%';`).
+
+### Renaming `aidacalls_db` to `aida_pbx_db`
+
+Environments set up before October 2026 hold AidaPbx's runtime database as
+`aidacalls_db` with the account `aida_runtime`; reruns keep those rows. Move an
+environment to the current names once, with AidaPbx stopped on the PBX host
+(`sudo systemctl stop aida-integration`), from this folder on the database host:
+
+```sh
+./install.sh rename-pbx-database
+```
+
+It runs AidaPbx's `scripts/rename-database.sh` against `platform-mysql-local`
+with the root password from `.env` (tables move with `RENAME TABLE`; the account
+is renamed and keeps its password), then sets `aida-pbx` `DB_NAME` and `DB_USER`.
+Start AidaPbx again afterwards. `--rollback` moves back to the old names. The
+full runbook is AidaPbx's `docs/RENAME_DATABASE.md`.
 
 Every scope also has `DB_HOST`, `DB_PORT`, and `DB_PASSWORD`. The installer uses
 AidaAdmin's and OfficePulse's own `scripts/db-users.sh` implementations to create
