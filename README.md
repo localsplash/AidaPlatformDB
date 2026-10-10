@@ -139,7 +139,8 @@ apps then reach MySQL by container name).
 ### c) The PBX host — `./install.sh officepulse`
 
 Requires Asterisk running on that host and Node 22. Clones
-`OfficePulseAidaIntegration`, writes its `/etc/aida-integration/env`
+`AidaPbx` (formerly `OfficePulseAidaIntegration`; an existing checkout under the
+old name is moved), writes its `/etc/aida-integration/env`
 (`NOCODB_BASE_URL`, `NOCODB_API_TOKEN`) and runs its own `scripts/install.sh`.
 Its settings are the `aida-pbx` rows (see that repository's README).
 
@@ -249,7 +250,7 @@ literally (not URL-encoded); `DB_PORT` is optional at runtime and defaults to 33
 | `aida-pbx` | `aidacalls_db` | `aida_runtime` | Runtime writer and schema migrations |
 
 `aida-pbx` is the bridge between OfficePulse's Asterisk and Aida's LiveKit agent
-(the OfficePulseAidaIntegration service); it was called `officepulse`. Every
+(the AidaPbx service, formerly OfficePulseAidaIntegration); it was called `officepulse`. Every
 phase that reaches PlatformConfig renames rows still under the old name in
 place, keeping their values; a key present under both names stops the run until
 one row is deleted.
