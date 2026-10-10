@@ -353,6 +353,46 @@ phase_apps
         self.assertEqual(path.read_bytes(), before)
         self.assertNotIn('pbx-secret', r.stdout + r.stderr)
 
+    def test_rename_pbx_database_runs_the_script_then_moves_the_rows(self):
+        platform = self.fake_platform()
+        self.file('AidaPlatformDB/.env', 'MYSQL_ROOT_PASSWORD=root-secret\nNOCODB_INSTALLER_TOKEN=installer-secret\n')
+        body = platform + r'''
+repo_script() { printf 'SCRIPT %s\n' "$*" >>"$DIR/calls"; }
+PHASE=rename-pbx-database; load_saved_inputs; phase_rename_pbx_database
+'''
+        def pbx_rows():
+            rows = json.loads((self.root / 'rows.json').read_text())
+            return {row['settingKey']: row['settingValue'] for row in rows if row['app'] == 'aida-pbx'}
+        r = self.shell(body)
+        self.assertNotIn('root-secret', r.stdout + r.stderr)
+        self.assertNotIn('installer-secret', r.stdout + r.stderr)
+        calls = (self.root / 'calls').read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        for arg in ('AidaPbx  rename-database.sh', 'MYSQL_ADMIN_HOST=platform-mysql-local', 'MYSQL_ADMIN_PASSWORD=root-secret',
+                    'FROM_DB=aidacalls_db', 'TO_DB=aida_pbx_db', 'FROM_USER=aida_runtime', 'TO_USER=aida_pbx_app'):
+            self.assertIn(arg, calls[0])
+        rows = pbx_rows()
+        self.assertEqual((rows['DB_NAME'], rows['DB_USER'], rows['DB_PASSWORD']), ('aida_pbx_db', 'aida_pbx_app', 'aida-pbx-db-secret'))
+        # A rerun still runs the (idempotent) script, from the other names, and changes no row.
+        before = (self.root / 'rows.json').read_bytes()
+        self.shell(body)
+        self.assertIn('FROM_DB=aidacalls_db TO_DB=aida_pbx_db', (self.root / 'calls').read_text().splitlines()[1].replace(' -e ', ' '))
+        self.assertEqual(before, (self.root / 'rows.json').read_bytes())
+        # Rollback swaps the names back.
+        self.shell(body.replace('phase_rename_pbx_database', 'ROLLBACK=1; phase_rename_pbx_database'))
+        last = (self.root / 'calls').read_text().splitlines()[-1]
+        self.assertIn('FROM_DB=aida_pbx_db', last)
+        self.assertIn('TO_USER=aida_runtime', last)
+        self.assertEqual((pbx_rows()['DB_NAME'], pbx_rows()['DB_USER']), ('aidacalls_db', 'aida_runtime'))
+
+    def test_rename_pbx_database_leaves_rows_alone_when_the_script_fails(self):
+        platform = self.fake_platform()
+        self.file('AidaPlatformDB/.env', 'MYSQL_ROOT_PASSWORD=root-secret\nNOCODB_INSTALLER_TOKEN=installer-secret\n')
+        before = (self.root / 'rows.json').read_bytes()
+        r = self.shell(platform + 'repo_script() { return 2; }\nPHASE=rename-pbx-database; load_saved_inputs; phase_rename_pbx_database\n', ok=False)
+        self.assertEqual(before, (self.root / 'rows.json').read_bytes())
+        self.assertNotIn('root-secret', r.stdout + r.stderr)
+
     def test_checkout_under_old_repository_name_moves_once(self):
         self.file('OfficePulseAidaIntegration/.git/HEAD', 'ref: refs/heads/dev\n')
         body = 'git() { echo "git $*"; }; move_renamed_checkout OfficePulseAidaIntegration AidaPbx\n'
