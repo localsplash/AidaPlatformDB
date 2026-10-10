@@ -4,7 +4,7 @@
 #
 #   ./install.sh database     the shared MySQL and NocoDB (this host)
 #   ./install.sh apps         Identity, AidaAdmin, AidaAgent and the Echo environment
-#   ./install.sh officepulse  OfficePulseAidaIntegration on the PBX host
+#   ./install.sh officepulse  AidaPbx (the OfficePulse bridge) on the PBX host
 #   ./install.sh all          database, then apps, on one host
 #   ./install.sh migrate-data move MySQL's and NocoDB's data from the Docker
 #                             volumes an older checkout used onto the host
@@ -717,7 +717,7 @@ provision_aida_databases() { # ADMIN_HOST ROOT_PASSWORD
   # accidentally invoking an older application checkout on the database host.
   repo_script AidaAdmin "" db-users.sh "${AIDA_ADMIN_DB_ARGS[@]}" \
     -e MYSQL_ADMIN_HOST="$1" -e MYSQL_ADMIN_PORT=3306 -e MYSQL_ADMIN_PASSWORD="$2"
-  repo_script OfficePulseAidaIntegration "" db-users.sh \
+  repo_script AidaPbx "" db-users.sh \
     "${AIDA_RUNTIME_DB_ARGS[@]}" \
     -e MYSQL_ADMIN_HOST="$1" -e MYSQL_ADMIN_PORT=3306 -e MYSQL_ADMIN_PASSWORD="$2"
 }
@@ -775,6 +775,17 @@ compose_up() { # DIR
 # repo_script REPO LOCAL_DIR SCRIPT [docker -e ...]: runs an application's own
 # scripts/<SCRIPT> (its checkout beside this one when present, otherwise a
 # shallow clone at --branch) in a throwaway MySQL client on the platform network.
+# A checkout cloned under a repository's old name moves to its new name, so
+# reruns keep pulling it rather than cloning a second copy beside it.
+move_renamed_checkout() { # OLD NEW
+  local old="$DIR/$1" new="$DIR/$2"
+  [ -d "$old/.git" ] || return 0
+  if [ -e "$new" ]; then note "$old is no longer used ($2 is at $new): delete it when convenient"; return 0; fi
+  note "$old: repository renamed $2, moving the checkout to $new"
+  run mv "$old" "$new"
+  run git -C "$new" remote set-url origin "$GIT_BASE/$2.git"
+}
+
 repo_script() {
   local repo=$1 local_dir=$2 script=$3; shift 3
   local src=$local_dir tmp="" branch
@@ -1233,7 +1244,7 @@ phase_apps() {
     note "echo_web and echo_service are created by the Echo environment's own jobs at deploy"
   fi
   if ! (( aida_accounts_done )); then
-    log "Provisioning AidaAdmin, OfficePulse runtime, and the read-only runtime account"
+    log "Provisioning the AidaAdmin and OfficePulse runtime accounts"
     provision_aida_databases "$DB_HOST" "$MYSQL_ADMIN_PASSWORD"
   fi
 
@@ -1267,7 +1278,7 @@ phase_apps() {
 # ── Phase c: the PBX host ────────────────────────────────────────────────────
 
 phase_officepulse() {
-  log "PBX host: OfficePulseAidaIntegration under $DIR"
+  log "PBX host: AidaPbx under $DIR"
   prereqs git node npm rsync jq openssl curl
   if ! systemctl is-active --quiet asterisk 2>/dev/null; then
     note "Asterisk is not running on this host (systemctl is-active asterisk). OfficePulse needs it; continuing anyway."
@@ -1288,7 +1299,8 @@ phase_officepulse() {
   row_ensure aida-pbx OFFICEPULSE_INSTANCE_ID "officepulse-$env_name" false "PBX instance wire name (pbxInstanceId) this OfficePulse serves."
   row_ensure aida-pbx OPS_PUBLIC_URL "https://officepulse-admin.$PARENT_DOMAIN" false "Public origin of the operations UI."
   row_ensure aida-pbx OPS_API_URL "https://officepulse-api.$PARENT_DOMAIN" false "Public origin of the private API as the other applications call it."
-  clone_or_update OfficePulseAidaIntegration "$DIR/OfficePulseAidaIntegration"
+  move_renamed_checkout OfficePulseAidaIntegration AidaPbx
+  clone_or_update AidaPbx "$DIR/AidaPbx"
   local env_file=$OFFICEPULSE_ENV_FILE
   log "$env_file"
   run mkdir -p "$(dirname "$env_file")"
@@ -1298,7 +1310,7 @@ phase_officepulse() {
   note "Every other OfficePulse value is an aida-pbx/* row (its README lists them); the service reads them at start."
   if (( NO_DEPLOY )); then log "--no-deploy: stopping before its installer"; return 0; fi
   log "Running OfficePulse's own installer"
-  run "$DIR/OfficePulseAidaIntegration/scripts/install.sh"
+  run "$DIR/AidaPbx/scripts/install.sh"
 }
 
 # ── Arguments ────────────────────────────────────────────────────────────────

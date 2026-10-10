@@ -353,6 +353,19 @@ phase_apps
         self.assertEqual(path.read_bytes(), before)
         self.assertNotIn('pbx-secret', r.stdout + r.stderr)
 
+    def test_checkout_under_old_repository_name_moves_once(self):
+        self.file('OfficePulseAidaIntegration/.git/HEAD', 'ref: refs/heads/dev\n')
+        body = 'git() { echo "git $*"; }; move_renamed_checkout OfficePulseAidaIntegration AidaPbx\n'
+        r = self.shell(body)
+        self.assertTrue((self.root / 'AidaPbx/.git/HEAD').exists())
+        self.assertFalse((self.root / 'OfficePulseAidaIntegration').exists())
+        self.assertIn('remote set-url origin', r.stdout + r.stderr)
+        self.assertIn('/AidaPbx.git', r.stdout + r.stderr)
+        self.file('OfficePulseAidaIntegration/.git/HEAD', 'ref: refs/heads/dev\n')
+        r = self.shell(body)
+        self.assertTrue((self.root / 'OfficePulseAidaIntegration/.git/HEAD').exists())
+        self.assertIn('no longer used', r.stdout + r.stderr)
+
     def test_actual_platform_rows_override_offline_hints_without_rotation(self):
         platform = self.fake_platform()
         self.shell(platform + '''
