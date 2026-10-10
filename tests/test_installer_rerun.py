@@ -285,8 +285,7 @@ load_saved_inputs
                     ('*', 'trustedCIDR', '10.0.0.0/8'), ('echo', 'DB_HOST', 'platform-mysql-local'),
                     ('echo', 'MYSQL_ADMIN_PASSWORD', 'echo-admin-secret'), ('echo', 'MYSQL_ADMIN_USER', 'echo_admin')]
         for app, name, user in [('aida-admin', 'aida_admin_db', 'aida_admin_app'),
-                                ('aida-pbx', 'aidacalls_db', 'aida_runtime'),
-                                ('aida-pbx-reader', 'aidacalls_db', 'aidaadmin_ro')]:
+                                ('aida-pbx', 'aidacalls_db', 'aida_runtime')]:
             settings += [(app, 'DB_HOST', 'platform-mysql-local'), (app, 'DB_PORT', '3306'),
                          (app, 'DB_NAME', name), (app, 'DB_USER', user), (app, 'DB_PASSWORD', app + '-db-secret')]
         self.file('rows.json', json.dumps([dict(Id=i + 1, app=app, settingKey=key, settingValue=value,
@@ -386,10 +385,13 @@ rows_load
         for _ in range(2):
             r = self.shell(body + 'rename_settings_scopes\n')
             self.assertNotIn('reader-keep-secret', r.stdout + r.stderr)
+            # The retired reader scope is reported for a person to delete, never moved or deleted.
+            self.assertIn('aida-admin-runtime (1 rows) is no longer read', r.stdout)
+            self.assertIn("DROP USER IF EXISTS 'aidaadmin_ro'", r.stdout)
         rows = json.loads((self.root / 'rows.json').read_text())
         self.assertEqual([(row['Id'], row['app'], row['settingKey'], row['settingValue']) for row in rows], [
             (1, 'aida-pbx', 'DB_USER', 'aida_runtime'), (2, 'aida-pbx', 'ARI_URL', 'http://pbx'),
-            (3, 'aida-pbx-reader', 'DB_PASSWORD', 'reader-keep-secret'), (4, 'aida', 'LIVEKIT_URL', 'wss://lk')])
+            (3, 'aida-admin-runtime', 'DB_PASSWORD', 'reader-keep-secret'), (4, 'aida', 'LIVEKIT_URL', 'wss://lk')])
 
     def test_renamed_scope_refuses_a_key_under_both_names(self):
         body = self.renamed_scope_fixture([('officepulse', 'ARI_URL', 'old'), ('aida-pbx', 'ARI_URL', 'new')])

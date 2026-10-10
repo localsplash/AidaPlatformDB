@@ -522,9 +522,13 @@ rows_load() {
 
 # Scopes renamed in place, so every application reads its rows under the new
 # name without re-entering a value. The bridge between OfficePulse's Asterisk
-# and Aida's LiveKit agent is aida-pbx; AidaAdmin's read-only view of its
-# database is aida-pbx-reader.
-RENAMED_SCOPES=("officepulse aida-pbx" "aida-admin-runtime aida-pbx-reader")
+# and Aida's LiveKit agent is aida-pbx.
+RENAMED_SCOPES=("officepulse aida-pbx")
+# Scopes no application reads any more. AidaAdmin's read-only login on
+# aidacalls_db (aidaadmin_ro) was replaced by OfficePulse's private API; its
+# rows hold a password, so they are reported for a person to delete, never
+# deleted here.
+RETIRED_SCOPES=(aida-admin-runtime aida-pbx-reader)
 
 rename_settings_scopes() {
   local pair old new ids key
@@ -544,6 +548,13 @@ rename_settings_scopes() {
       die "could not rename PlatformConfig scope $old to $new"
   done
   if ! (( DRY )) && [ "$TABLE_ID" != dry ]; then rows_load; fi
+  local retired count
+  for retired in "${RETIRED_SCOPES[@]}"; do
+    count=$(jq --arg o "$retired" '[.[] | select(.app==$o)] | length' <<<"$ROWS_JSON")
+    [ "$count" = 0 ] && continue
+    note "PlatformConfig scope $retired ($count rows) is no longer read: AidaAdmin reads OfficePulse's API instead."
+    note "  Delete those rows in NocoDB, and on the database host: DROP USER IF EXISTS 'aidaadmin_ro'@'%';"
+  done
 }
 
 row_get() { # APP KEY -> value ('' when absent or blank)
@@ -635,14 +646,13 @@ has_database_password() {
   [ -z "$ROW_VALUE" ] || return 0
   case $1 in
     aida-admin) db_row_read aida-admin AIDA_ADMIN_DATABASE_URL ;;
-    aida-pbx-reader) db_row_read aida-admin OFFICEPULSE_RUNTIME_DATABASE_URL ;;
     aida-pbx) legacy_runtime_value RUNTIME_MYSQL_PASSWORD ;;
   esac
   [ -n "$ROW_VALUE" ]
 }
 
 aida_database_accounts_ready() {
-  has_database_password aida-admin && has_database_password aida-pbx && has_database_password aida-pbx-reader
+  has_database_password aida-admin && has_database_password aida-pbx
 }
 
 # database_rows APP HOST NAME USER [LEGACY_APP LEGACY_URL_KEY]
@@ -687,25 +697,19 @@ database_rows() {
   DB_ROW_ARGS=(-e DB_HOST="$DB_ROW_HOST" -e DB_PORT="$DB_ROW_PORT" -e DB_NAME="$DB_ROW_NAME" -e DB_USER="$DB_ROW_USER" -e DB_PASSWORD="$DB_ROW_PASSWORD")
 }
 
-seed_runtime_database_settings() { # MySQL host as AidaAdmin reaches it
+seed_runtime_database_settings() {
   # OfficePulse runs on the PBX host, not on the platform Docker network.
   database_rows aida-pbx "lsdb.$PARENT_DOMAIN" aidacalls_db aida_runtime
   AIDA_RUNTIME_DB_ARGS=("${DB_ROW_ARGS[@]}")
   AIDA_RUNTIME_DB_USER=$DB_ROW_USER
-  local runtime_name=$DB_ROW_NAME runtime_user=$DB_ROW_USER
-  database_rows aida-pbx-reader "$1" "$runtime_name" aidaadmin_ro aida-admin OFFICEPULSE_RUNTIME_DATABASE_URL
-  [ "$DB_ROW_NAME" = "$runtime_name" ] || die 'aida-pbx/DB_NAME and aida-pbx-reader/DB_NAME must match'
-  [ "$DB_ROW_USER" != "$runtime_user" ] || die 'OfficePulse and AidaAdmin runtime reader must use distinct DB_USER accounts'
-  AIDA_READER_DB_USER=$DB_ROW_USER
-  AIDA_READER_DB_ARGS=(-e READER_DB_NAME="$DB_ROW_NAME" -e READER_DB_USER="$DB_ROW_USER" -e READER_DB_PASSWORD="$DB_ROW_PASSWORD")
 }
 
 seed_aida_database_settings() {
   database_rows aida-admin "$1" aida_admin_db aida_admin_app aida-admin AIDA_ADMIN_DATABASE_URL
   AIDA_ADMIN_DB_ARGS=("${DB_ROW_ARGS[@]}")
   local admin_user=$DB_ROW_USER
-  seed_runtime_database_settings "$1"
-  [[ $admin_user != "$AIDA_RUNTIME_DB_USER" && $admin_user != "$AIDA_READER_DB_USER" ]] || die "AidaAdmin store, runtime writer and runtime reader must use distinct DB_USER accounts"
+  seed_runtime_database_settings
+  [ "$admin_user" != "$AIDA_RUNTIME_DB_USER" ] || die "AidaAdmin store and OfficePulse runtime must use distinct DB_USER accounts"
 }
 
 provision_aida_databases() { # ADMIN_HOST ROOT_PASSWORD
@@ -714,7 +718,7 @@ provision_aida_databases() { # ADMIN_HOST ROOT_PASSWORD
   repo_script AidaAdmin "" db-users.sh "${AIDA_ADMIN_DB_ARGS[@]}" \
     -e MYSQL_ADMIN_HOST="$1" -e MYSQL_ADMIN_PORT=3306 -e MYSQL_ADMIN_PASSWORD="$2"
   repo_script OfficePulseAidaIntegration "" db-users.sh \
-    "${AIDA_RUNTIME_DB_ARGS[@]}" "${AIDA_READER_DB_ARGS[@]}" \
+    "${AIDA_RUNTIME_DB_ARGS[@]}" \
     -e MYSQL_ADMIN_HOST="$1" -e MYSQL_ADMIN_PORT=3306 -e MYSQL_ADMIN_PASSWORD="$2"
 }
 
@@ -811,7 +815,7 @@ database_accounts() {
   row_default identity DB_PASSWORD "$(secret)" true "Password for DB_USER; the same value identity/scripts/db-users.sh sets."
   repo_script identity "$DIR/identity" db-users.sh -e DB_HOST=platform-mysql-local -e DB_PASSWORD="$ROW_VALUE" -e MYSQL_ADMIN_PASSWORD="$root"
 
-  log "Aida databases: scoped DB_* rows and dedicated writer/reader accounts"
+  log "Aida databases: scoped DB_* rows and one dedicated account per application"
   seed_aida_database_settings "$app_db_host"
   provision_aida_databases platform-mysql-local "$root"
 
@@ -1274,10 +1278,10 @@ phase_officepulse() {
   ask_installer_token "$TOKEN_OFFICEPULSE"
   ensure_platformconfig
   if (( SAVE_INSTALLER_TOKEN )); then env_write "$SELF_DIR/.env" NOCODB_INSTALLER_TOKEN "$NOCODB_TOKEN"; fi
-  if ! has_database_password aida-pbx || ! has_database_password aida-pbx-reader; then
+  if ! has_database_password aida-pbx; then
     die "Runtime database accounts are not configured: run 'install.sh database' or 'install.sh apps' first"
   fi
-  seed_runtime_database_settings "${DB_HOST:-lsdb.$PARENT_DOMAIN}"
+  seed_runtime_database_settings
   # What this host can derive for OfficePulse; the PBX-specific rows (its
   # Asterisk realtime database, ARI, the LiveKit SIP host) are its operator's.
   local env_name; env_name=$(row_get '*' ENVIRONMENT_NAME); env_name=${env_name:-${ENVIRONMENT_NAME:-dev}}

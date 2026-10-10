@@ -247,13 +247,17 @@ literally (not URL-encoded); `DB_PORT` is optional at runtime and defaults to 33
 | --- | --- | --- | --- |
 | `aida-admin` | `aida_admin_db` | `aida_admin_app` | Admin's writable OAuth state, event receipts and audit store |
 | `aida-pbx` | `aidacalls_db` | `aida_runtime` | Runtime writer and schema migrations |
-| `aida-pbx-reader` | `aidacalls_db` | `aidaadmin_ro` | Admin's SELECT-only view of runtime state |
 
 `aida-pbx` is the bridge between OfficePulse's Asterisk and Aida's LiveKit agent
-(the OfficePulseAidaIntegration service); it was called `officepulse`, and
-`aida-pbx-reader` was `aida-admin-runtime`. Every phase that reaches
-PlatformConfig renames rows still under the old names in place, keeping their
-values; a key present under both names stops the run until one row is deleted.
+(the OfficePulseAidaIntegration service); it was called `officepulse`. Every
+phase that reaches PlatformConfig renames rows still under the old name in
+place, keeping their values; a key present under both names stops the run until
+one row is deleted.
+
+AidaAdmin reads runtime state through OfficePulse's private API, so it has no
+login on `aidacalls_db`. Rows left under the retired `aida-admin-runtime` scope
+are reported, not deleted: remove them in NocoDB and drop the `aidaadmin_ro`
+MySQL user (`DROP USER IF EXISTS 'aidaadmin_ro'@'%';`).
 
 Every scope also has `DB_HOST`, `DB_PORT`, and `DB_PASSWORD`. The installer uses
 AidaAdmin's and OfficePulse's own `scripts/db-users.sh` implementations to create
