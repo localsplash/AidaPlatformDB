@@ -285,8 +285,7 @@ load_saved_inputs
                     ('*', 'trustedCIDR', '10.0.0.0/8'), ('echo', 'DB_HOST', 'platform-mysql-local'),
                     ('echo', 'MYSQL_ADMIN_PASSWORD', 'echo-admin-secret'), ('echo', 'MYSQL_ADMIN_USER', 'echo_admin')]
         for app, name, user in [('aida-admin', 'aida_admin_db', 'aida_admin_app'),
-                                ('officepulse', 'aidacalls_db', 'aida_runtime'),
-                                ('aida-admin-runtime', 'aidacalls_db', 'aidaadmin_ro')]:
+                                ('aida-pbx', 'aidacalls_db', 'aida_runtime')]:
             settings += [(app, 'DB_HOST', 'platform-mysql-local'), (app, 'DB_PORT', '3306'),
                          (app, 'DB_NAME', name), (app, 'DB_USER', user), (app, 'DB_PASSWORD', app + '-db-secret')]
         self.file('rows.json', json.dumps([dict(Id=i + 1, app=app, settingKey=key, settingValue=value,
@@ -367,6 +366,46 @@ ENVIRONMENT_NAME=prod; GIVEN_INPUTS[ENVIRONMENT_NAME]=1
 sync_platform_identity
 [ "$(row_get '*' ENVIRONMENT_NAME)" = prod ]
 ''')
+
+    def renamed_scope_fixture(self, settings):
+        self.fake_platform()
+        self.file('rows.json', json.dumps([dict(Id=i + 1, app=app, settingKey=key, settingValue=value)
+                                          for i, (app, key, value) in enumerate(settings)]))
+        return '''
+TABLE_ID=test
+rows_load() { ROWS_JSON=$(cat "$DIR/rows.json"); }
+nc() { python3 "$DIR/fake_nc.py" "$DIR/rows.json" "$@"; }
+rows_load
+'''
+
+    def test_renamed_scopes_move_existing_rows_in_place(self):
+        settings = [('officepulse', 'DB_USER', 'aida_runtime'), ('officepulse', 'ARI_URL', 'http://pbx'),
+                    ('aida-admin-runtime', 'DB_PASSWORD', 'reader-keep-secret'), ('aida', 'LIVEKIT_URL', 'wss://lk')]
+        body = self.renamed_scope_fixture(settings)
+        for _ in range(2):
+            r = self.shell(body + 'rename_settings_scopes\n')
+            self.assertNotIn('reader-keep-secret', r.stdout + r.stderr)
+            # The retired reader scope is reported for a person to delete, never moved or deleted.
+            self.assertIn('aida-admin-runtime (1 rows) is no longer read', r.stdout)
+            self.assertIn("DROP USER IF EXISTS 'aidaadmin_ro'", r.stdout)
+        rows = json.loads((self.root / 'rows.json').read_text())
+        self.assertEqual([(row['Id'], row['app'], row['settingKey'], row['settingValue']) for row in rows], [
+            (1, 'aida-pbx', 'DB_USER', 'aida_runtime'), (2, 'aida-pbx', 'ARI_URL', 'http://pbx'),
+            (3, 'aida-admin-runtime', 'DB_PASSWORD', 'reader-keep-secret'), (4, 'aida', 'LIVEKIT_URL', 'wss://lk')])
+
+    def test_renamed_scope_refuses_a_key_under_both_names(self):
+        body = self.renamed_scope_fixture([('officepulse', 'ARI_URL', 'old'), ('aida-pbx', 'ARI_URL', 'new')])
+        before = (self.root / 'rows.json').read_bytes()
+        r = self.shell(body + 'rename_settings_scopes\n', ok=False)
+        self.assertIn('officepulse/ARI_URL and aida-pbx/ARI_URL', r.stderr)
+        self.assertEqual(before, (self.root / 'rows.json').read_bytes())
+
+    def test_dry_run_reports_renamed_scopes_without_writes(self):
+        body = self.renamed_scope_fixture([('officepulse', 'ARI_URL', 'old')])
+        before = (self.root / 'rows.json').read_bytes()
+        r = self.shell(body + 'DRY=1; nc() { die "dry run wrote"; }; rename_settings_scopes\n')
+        self.assertIn('officepulse renamed aida-pbx', r.stdout)
+        self.assertEqual(before, (self.root / 'rows.json').read_bytes())
 
     def test_literal_bootstrap_tokens_roundtrip_without_interpolation(self):
         for value in ('ordinary', 'literal$NAME#%40 with space', "quote'token", r'backslash\token',

@@ -27,7 +27,7 @@ seed_aida_database_settings ignored-second-host
 aida_database_accounts_ready || die 'Seeded accounts should be ready'
 printf '%s\n' "$ROWS_JSON"
 # Verify the same literal passwords go to provisioning, including trailing newlines.
-printf '%s\0' "${AIDA_ADMIN_DB_ARGS[@]}" "${AIDA_RUNTIME_DB_ARGS[@]}" "${AIDA_READER_DB_ARGS[@]}" >&3
+printf '%s\0' "${AIDA_ADMIN_DB_ARGS[@]}" "${AIDA_RUNTIME_DB_ARGS[@]}" >&3
 '''
 
 
@@ -52,39 +52,34 @@ class DatabaseSettingsTests(unittest.TestCase):
 
     def test_fresh_settings_are_scoped_secret_and_idempotent(self):
         rows, args = self.run_seed()
-        self.assertEqual(len(rows), 15)
+        self.assertEqual(len(rows), 10)
         for app, name, user, host in [
             ("aida-admin", "aida_admin_db", "aida_admin_app", "platform-mysql-local"),
-            ("officepulse", "aidacalls_db", "aida_runtime", "lsdb.example.test"),
-            ("aida-admin-runtime", "aidacalls_db", "aidaadmin_ro", "platform-mysql-local"),
+            ("aida-pbx", "aidacalls_db", "aida_runtime", "lsdb.example.test"),
         ]:
             for key, value in {"DB_NAME": name, "DB_USER": user, "DB_HOST": host, "DB_PORT": "3306"}.items():
                 self.assertEqual(rows[app, key]["settingValue"], value)
             password = rows[app, "DB_PASSWORD"]
             self.assertTrue(password["bSecret"])
-            prefix = "READER_DB_PASSWORD=" if app == "aida-admin-runtime" else "DB_PASSWORD="
-            self.assertIn(prefix + password["settingValue"], args)
-        self.assertEqual(len({rows[app, "DB_PASSWORD"]["settingValue"]
-                              for app in ("aida-admin", "officepulse", "aida-admin-runtime")}), 3)
+            self.assertIn("DB_PASSWORD=" + password["settingValue"], args)
+        self.assertEqual(len({rows[app, "DB_PASSWORD"]["settingValue"] for app in ("aida-admin", "aida-pbx")}), 2)
+        self.assertFalse(any(app == "aida-pbx-reader" for app, _ in rows), "no read-only account is seeded")
 
     def test_migrates_urls_and_old_runtime_keys_without_rotating_or_trimming(self):
-        admin_password, reader_password, writer_password = "p@ss%:/é'\\\n", " reader'\\$()%40\n", "writer%40\n"
+        admin_password, writer_password = "p@ss%:/é'\\\n", "writer%40\n"
         rows, args = self.run_seed([
             row("aida-admin", "AIDA_ADMIN_DATABASE_URL", f"mysql://aida_admin_app:{quote(admin_password, safe='')}@admin-host:3307/aida_admin_db"),
-            row("aida-admin", "OFFICEPULSE_RUNTIME_DATABASE_URL", f"mysql://aidaadmin%5Fro:{quote(reader_password, safe='')}@reader-host:3308/aidacalls_db"),
-            row("officepulse", "RUNTIME_MYSQL_HOST", "127.0.0.1"),
-            row("officepulse", "RUNTIME_MYSQL_PORT", "13306"),
-            row("officepulse", "RUNTIME_MYSQL_USER", "aida_runtime"),
-            row("officepulse", "RUNTIME_MYSQL_DATABASE", "aidacalls_db"),
-            row("officepulse", "RUNTIME_MYSQL_PASSWORD", writer_password),
+            row("aida-pbx", "RUNTIME_MYSQL_HOST", "127.0.0.1"),
+            row("aida-pbx", "RUNTIME_MYSQL_PORT", "13306"),
+            row("aida-pbx", "RUNTIME_MYSQL_USER", "aida_runtime"),
+            row("aida-pbx", "RUNTIME_MYSQL_DATABASE", "aidacalls_db"),
+            row("aida-pbx", "RUNTIME_MYSQL_PASSWORD", writer_password),
         ])
-        for app, expected in [("aida-admin", admin_password), ("aida-admin-runtime", reader_password), ("officepulse", writer_password)]:
+        for app, expected in [("aida-admin", admin_password), ("aida-pbx", writer_password)]:
             self.assertEqual(rows[app, "DB_PASSWORD"]["settingValue"], expected)
-            prefix = "READER_DB_PASSWORD=" if app == "aida-admin-runtime" else "DB_PASSWORD="
-            self.assertIn(prefix + expected, args)
-        self.assertEqual(rows["officepulse", "DB_HOST"]["settingValue"], "127.0.0.1")
-        self.assertEqual(rows["officepulse", "DB_PORT"]["settingValue"], "13306")
-        self.assertEqual(rows["aida-admin-runtime", "DB_USER"]["settingValue"], "aidaadmin_ro")
+            self.assertIn("DB_PASSWORD=" + expected, args)
+        self.assertEqual(rows["aida-pbx", "DB_HOST"]["settingValue"], "127.0.0.1")
+        self.assertEqual(rows["aida-pbx", "DB_PORT"]["settingValue"], "13306")
         self.assertEqual(rows["aida-admin", "DB_PORT"]["settingValue"], "3307")
 
     def test_canonical_rows_override_legacy_fields(self):
@@ -111,13 +106,8 @@ class DatabaseSettingsTests(unittest.TestCase):
                 self.assertNotIn(value, result.stderr)
                 self.assertNotIn("secret%", result.stderr)
 
-    def test_runtime_reader_cannot_use_another_schema_or_writer(self):
-        for key, value in [("DB_NAME", "different_db"), ("DB_USER", "aida_runtime")]:
-            with self.subTest(key=key):
-                self.run_seed([row("aida-admin-runtime", key, value)], success=False)
-
-    def test_admin_store_account_cannot_be_the_runtime_reader(self):
-        result = self.run_seed([row("aida-admin", "DB_USER", "aidaadmin_ro")], success=False)
+    def test_admin_store_account_cannot_be_the_runtime_writer(self):
+        result = self.run_seed([row("aida-admin", "DB_USER", "aida_runtime")], success=False)
         self.assertIn("distinct DB_USER", result.stderr)
 
     def test_dry_run_uses_no_api_writes_and_does_not_print_passwords(self):
