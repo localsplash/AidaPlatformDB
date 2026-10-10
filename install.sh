@@ -8,6 +8,10 @@
 #   ./install.sh all          database, then apps, on one host
 #   ./install.sh migrate-data move MySQL's and NocoDB's data from the Docker
 #                             volumes an older checkout used onto the host
+#   ./install.sh rename-pbx-database
+#                             one time, on the database host with AidaPbx
+#                             stopped: aidacalls_db/aida_runtime become
+#                             aida_pbx_db/aida_pbx_app (--rollback reverses)
 #
 # Run it from a checkout, or straight from GitHub on a fresh host:
 #
@@ -31,6 +35,7 @@ DIR_GIVEN=0
 YES=0
 DRY=0
 NO_DEPLOY=0
+ROLLBACK=0
 PARENT_DOMAIN=${PARENT_DOMAIN:-}
 ENVIRONMENT_NAME=${ENVIRONMENT_NAME:-}
 NOCODB_BASE_URL=${NOCODB_BASE_URL:-}
@@ -67,7 +72,7 @@ ECHO_NETWORK=echo-local
 ECHO_SUBNET=10.247.23.0/24
 
 usage() {
-  sed -n '3,20p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '3,24p' "$SELF" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 Options
@@ -87,6 +92,7 @@ Options
   --yes                    never prompt; use saved values/defaults unless explicitly overridden
   --no-deploy              clone, write .env files, create accounts and rows, but do not build or start
   --dry-run                preview changes with secrets hidden; skip checkout auto-update
+  --rollback               rename-pbx-database: move back to aidacalls_db/aida_runtime
   -h, --help
 EOF
 }
@@ -525,7 +531,7 @@ rows_load() {
 # and Aida's LiveKit agent is aida-pbx.
 RENAMED_SCOPES=("officepulse aida-pbx")
 # Scopes no application reads any more. AidaAdmin's read-only login on
-# aidacalls_db (aidaadmin_ro) was replaced by OfficePulse's private API; its
+# AidaPbx's runtime database (aidaadmin_ro) was replaced by OfficePulse's private API; its
 # rows hold a password, so they are reported for a person to delete, never
 # deleted here.
 RETIRED_SCOPES=(aida-admin-runtime aida-pbx-reader)
@@ -699,7 +705,9 @@ database_rows() {
 
 seed_runtime_database_settings() {
   # OfficePulse runs on the PBX host, not on the platform Docker network.
-  database_rows aida-pbx "lsdb.$PARENT_DOMAIN" aidacalls_db aida_runtime
+  # Environments set up before the rename keep aidacalls_db/aida_runtime in
+  # their rows until `install.sh rename-pbx-database` moves them.
+  database_rows aida-pbx "lsdb.$PARENT_DOMAIN" aida_pbx_db aida_pbx_app
   AIDA_RUNTIME_DB_ARGS=("${DB_ROW_ARGS[@]}")
   AIDA_RUNTIME_DB_USER=$DB_ROW_USER
 }
@@ -962,7 +970,7 @@ unmigrated_volumes() {
 fresh_instance() {
   local dir=$1 kind=$2
   case $kind in
-    mysql) [ -d "$dir/mysql" ] && [ ! -d "$dir/platform_db" ] && [ ! -d "$dir/echo_db" ] && [ ! -d "$dir/aida_admin_db" ] && [ ! -d "$dir/aidacalls_db" ] ;;
+    mysql) [ -d "$dir/mysql" ] && [ ! -d "$dir/platform_db" ] && [ ! -d "$dir/echo_db" ] && [ ! -d "$dir/aida_admin_db" ] && [ ! -d "$dir/aidacalls_db" ] && [ ! -d "$dir/aida_pbx_db" ] ;;
     nocodb) [ -f "$dir/noco.db" ] && have python3 && [ "$(python3 - "$dir/noco.db" <<'PY'
 import sqlite3, sys
 try:
@@ -1313,6 +1321,39 @@ phase_officepulse() {
   run "$DIR/AidaPbx/scripts/install.sh"
 }
 
+# ── rename-pbx-database: AidaPbx's runtime database under its current name ──
+
+# MySQL cannot rename a database: AidaPbx's scripts/rename-database.sh moves
+# the tables into a new one and renames the account (keeping its password),
+# then the aida-pbx rows follow. Run on the database host with AidaPbx stopped;
+# the script refuses while anything is connected. Rerunning is harmless.
+phase_rename_pbx_database() {
+  local to_db=aida_pbx_db to_user=aida_pbx_app other_db=aidacalls_db other_user=aida_runtime
+  if (( ROLLBACK )); then to_db=aidacalls_db; to_user=aida_runtime; other_db=aida_pbx_db; other_user=aida_pbx_app; fi
+  log "Database host: AidaPbx's runtime database and account to $to_db / $to_user"
+  prereqs docker git jq curl
+  local root=${MYSQL_ADMIN_PASSWORD:-$(env_get "$SELF_DIR/.env" MYSQL_ROOT_PASSWORD)}
+  [ -n "$root" ] || (( DRY )) || die "MYSQL_ROOT_PASSWORD is missing from $SELF_DIR/.env: run this on the database host, from the AidaPlatformDB folder"
+  [ -n "$NOCODB_BASE_URL" ] || NOCODB_BASE_URL=$(env_get "$SELF_DIR/.env" NOCODB_BASE_URL)
+  NOCODB_API_URL=${NOCODB_API_URL:-http://127.0.0.1:18087}
+  ask NOCODB_TOKEN --nocodb-token "The installer token"
+  ensure_platformconfig
+  local from_db from_user
+  from_db=$(row_get aida-pbx DB_NAME); from_user=$(row_get aida-pbx DB_USER)
+  [ -n "$from_db" ] && [ -n "$from_user" ] || die "PlatformConfig has no aida-pbx DB_NAME and DB_USER: nothing to rename"
+  # Rows already naming the target may still front an unrenamed database (a
+  # run that stopped before finishing, or rows edited by hand): the script
+  # then finds the other names and finishes, or reports nothing to do.
+  [ "$from_db" != "$to_db" ] || from_db=$other_db
+  [ "$from_user" != "$to_user" ] || from_user=$other_user
+  repo_script AidaPbx "" rename-database.sh -e MYSQL_ADMIN_HOST=platform-mysql-local -e MYSQL_ADMIN_PASSWORD="$root" \
+    -e FROM_DB="$from_db" -e TO_DB="$to_db" -e FROM_USER="$from_user" -e TO_USER="$to_user"
+  [ "$(row_get aida-pbx DB_NAME)" = "$to_db" ] || row_set aida-pbx DB_NAME "$to_db"
+  [ "$(row_get aida-pbx DB_USER)" = "$to_user" ] || row_set aida-pbx DB_USER "$to_user"
+  log "Done. aida-pbx/DB_NAME=$to_db and DB_USER=$to_user; DB_PASSWORD is unchanged."
+  note "Start AidaPbx on the PBX host: sudo systemctl start aida-integration"
+}
+
 # ── Arguments ────────────────────────────────────────────────────────────────
 
 # Test seam: `INSTALL_SOURCE_ONLY=1 source install.sh` loads the functions only.
@@ -1322,7 +1363,7 @@ ARGS=("$@")
 PHASE=""
 while [ $# -gt 0 ]; do
   case $1 in
-    database|apps|officepulse|all|migrate-data) PHASE=$1 ;;
+    database|apps|officepulse|all|migrate-data|rename-pbx-database) PHASE=$1 ;;
     --branch) BRANCH=$2; shift ;;
     --dir) DIR=$(readlink -f "$2"); DIR_GIVEN=1; shift ;;
     --parent-domain) PARENT_DOMAIN=$2; shift ;;
@@ -1342,6 +1383,7 @@ while [ $# -gt 0 ]; do
     --token-officepulse) TOKEN_OFFICEPULSE=$2; shift ;;
     --yes) YES=1 ;;
     --no-deploy) NO_DEPLOY=1 ;;
+    --rollback) ROLLBACK=1 ;;
     --dry-run) DRY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -1394,7 +1436,7 @@ fi
 (( DRY )) && log "Dry run: nothing below is applied"
 
 case $PHASE in
-  database|apps|officepulse|all)
+  database|apps|officepulse|all|rename-pbx-database)
     load_saved_inputs
     load_saved_platform_inputs
     ;;
@@ -1406,4 +1448,5 @@ case $PHASE in
   officepulse) phase_officepulse ;;
   all) phase_database; phase_apps ;;
   migrate-data) phase_migrate_data ;;
+  rename-pbx-database) phase_rename_pbx_database ;;
 esac

@@ -55,7 +55,7 @@ class DatabaseSettingsTests(unittest.TestCase):
         self.assertEqual(len(rows), 10)
         for app, name, user, host in [
             ("aida-admin", "aida_admin_db", "aida_admin_app", "platform-mysql-local"),
-            ("aida-pbx", "aidacalls_db", "aida_runtime", "lsdb.example.test"),
+            ("aida-pbx", "aida_pbx_db", "aida_pbx_app", "lsdb.example.test"),
         ]:
             for key, value in {"DB_NAME": name, "DB_USER": user, "DB_HOST": host, "DB_PORT": "3306"}.items():
                 self.assertEqual(rows[app, key]["settingValue"], value)
@@ -107,7 +107,7 @@ class DatabaseSettingsTests(unittest.TestCase):
                 self.assertNotIn("secret%", result.stderr)
 
     def test_admin_store_account_cannot_be_the_runtime_writer(self):
-        result = self.run_seed([row("aida-admin", "DB_USER", "aida_runtime")], success=False)
+        result = self.run_seed([row("aida-admin", "DB_USER", "aida_pbx_app")], success=False)
         self.assertIn("distinct DB_USER", result.stderr)
 
     def test_dry_run_uses_no_api_writes_and_does_not_print_passwords(self):
