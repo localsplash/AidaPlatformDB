@@ -535,6 +535,10 @@ RENAMED_SCOPES=("officepulse aida-pbx")
 # rows hold a password, so they are reported for a person to delete, never
 # deleted here.
 RETIRED_SCOPES=(aida-admin-runtime aida-pbx-reader)
+# Keys no application reads any more, in any scope. RUNTIME_MYSQL_* were
+# copied into the DB_* rows; NOCODB_BASE_NAME could never change which base is
+# read, since the base is found by its fixed name. Reported, never deleted.
+RETIRED_KEYS=(RUNTIME_MYSQL_HOST RUNTIME_MYSQL_PORT RUNTIME_MYSQL_USER RUNTIME_MYSQL_PASSWORD RUNTIME_MYSQL_DATABASE NOCODB_BASE_NAME)
 
 rename_settings_scopes() {
   local pair old new ids key
@@ -561,6 +565,45 @@ rename_settings_scopes() {
     note "PlatformConfig scope $retired ($count rows) is no longer read: AidaAdmin reads OfficePulse's API instead."
     note "  Delete those rows in NocoDB, and on the database host: DROP USER IF EXISTS 'aidaadmin_ro'@'%';"
   done
+  local found
+  for retired in "${RETIRED_KEYS[@]}"; do
+    # Only once the canonical DB_* rows exist do the runtime keys become dead.
+    [[ $retired != RUNTIME_MYSQL_* ]] || [ -n "$(row_get aida-pbx DB_PASSWORD)" ] || continue
+    found=$(jq -r --arg k "$retired" '[.[] | select(.settingKey==$k) | .app] | join(", ")' <<<"$ROWS_JSON")
+    [ -z "$found" ] || note "PlatformConfig $retired ($found) is no longer read by any application: delete it in NocoDB."
+  done
+}
+
+# Keys renamed within a scope ("APP OLD NEW"), in place so values and the
+# secret flag stay as they are. AidaPbx reads both names of these during the
+# switch; they are moved only by the phase that deploys the AidaPbx release
+# that reads the new names, so a running older release never loses them.
+RENAMED_PBX_KEYS=(
+  "aida-pbx MYSQL_HOST PBX_DB_HOST"
+  "aida-pbx MYSQL_PORT PBX_DB_PORT"
+  "aida-pbx MYSQL_DATABASE PBX_DB_NAME"
+  "aida-pbx PBX_INVENTORY_MYSQL_USER PBX_DB_INVENTORY_USER"
+  "aida-pbx PBX_INVENTORY_MYSQL_PASSWORD PBX_DB_INVENTORY_PASSWORD"
+  "aida-pbx PBX_PROVISIONING_MYSQL_USER PBX_DB_PROVISIONING_USER"
+  "aida-pbx PBX_PROVISIONING_MYSQL_PASSWORD PBX_DB_PROVISIONING_PASSWORD"
+)
+
+rename_setting_keys() {
+  local triple app old new id
+  for triple in "${RENAMED_PBX_KEYS[@]}"; do
+    read -r app old new <<<"$triple"
+    id=$(jq -r --arg a "$app" --arg k "$old" '[.[] | select(.app==$a and .settingKey==$k) | .Id] | .[0] // ""' <<<"$ROWS_JSON")
+    [ -n "$id" ] || continue
+    if jq -e --arg a "$app" --arg k "$new" 'any(.[]; .app==$a and .settingKey==$k)' <<<"$ROWS_JSON" >/dev/null; then
+      note "PlatformConfig has both $app/$old and $app/$new: $new is read, so delete $old in NocoDB"
+      continue
+    fi
+    note "PlatformConfig $app/$old renamed $new"
+    if (( DRY )) || [ "$TABLE_ID" = dry ]; then continue; fi
+    nc "/api/v2/tables/$TABLE_ID/records" -X PATCH --data "$(jq -n --argjson id "$id" --arg k "$new" '[{Id:$id, settingKey:$k}]')" >/dev/null ||
+      die "could not rename PlatformConfig $app/$old to $new"
+  done
+  if ! (( DRY )) && [ "$TABLE_ID" != dry ]; then rows_load; fi
 }
 
 row_get() { # APP KEY -> value ('' when absent or blank)
@@ -1309,6 +1352,8 @@ phase_officepulse() {
   row_ensure aida-pbx OPS_API_URL "https://officepulse-api.$PARENT_DOMAIN" false "Public origin of the private API as the other applications call it."
   move_renamed_checkout OfficePulseAidaIntegration AidaPbx
   clone_or_update AidaPbx "$DIR/AidaPbx"
+  # Only with a checkout that reads the new names (a dry run has none to check).
+  if [ ! -f "$DIR/AidaPbx/src/config.ts" ] || grep -q PBX_DB_HOST "$DIR/AidaPbx/src/config.ts"; then rename_setting_keys; fi
   local env_file=$OFFICEPULSE_ENV_FILE
   log "$env_file"
   run mkdir -p "$(dirname "$env_file")"

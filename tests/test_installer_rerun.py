@@ -446,6 +446,52 @@ rows_load
             (1, 'aida-pbx', 'DB_USER', 'aida_runtime'), (2, 'aida-pbx', 'ARI_URL', 'http://pbx'),
             (3, 'aida-admin-runtime', 'DB_PASSWORD', 'reader-keep-secret'), (4, 'aida', 'LIVEKIT_URL', 'wss://lk')])
 
+    def test_pbx_database_keys_are_renamed_in_place_keeping_values(self):
+        body = self.renamed_scope_fixture([
+            ('aida-pbx', 'MYSQL_HOST', 'pbx-db'), ('aida-pbx', 'PBX_INVENTORY_MYSQL_PASSWORD', 'ro-keep-secret'),
+            ('aida-pbx', 'PBX_PROVISIONING_MYSQL_USER', 'old_writer'), ('aida-pbx', 'PBX_DB_PROVISIONING_USER', 'new_writer'),
+            ('aida', 'MYSQL_HOST', 'other-scope')])
+        rows = json.loads((self.root / 'rows.json').read_text())
+        rows[1]['bSecret'] = True
+        (self.root / 'rows.json').write_text(json.dumps(rows))
+        for _ in range(2):
+            r = self.shell(body + 'rename_setting_keys\n')
+            self.assertNotIn('ro-keep-secret', r.stdout + r.stderr)
+            self.assertIn('both aida-pbx/PBX_PROVISIONING_MYSQL_USER and aida-pbx/PBX_DB_PROVISIONING_USER', r.stdout)
+        rows = json.loads((self.root / 'rows.json').read_text())
+        self.assertEqual([(row['Id'], row['app'], row['settingKey'], row['settingValue']) for row in rows], [
+            (1, 'aida-pbx', 'PBX_DB_HOST', 'pbx-db'), (2, 'aida-pbx', 'PBX_DB_INVENTORY_PASSWORD', 'ro-keep-secret'),
+            (3, 'aida-pbx', 'PBX_PROVISIONING_MYSQL_USER', 'old_writer'), (4, 'aida-pbx', 'PBX_DB_PROVISIONING_USER', 'new_writer'),
+            (5, 'aida', 'MYSQL_HOST', 'other-scope')])
+        self.assertTrue(rows[1]['bSecret'])
+
+    def test_officepulse_phase_renames_keys_only_with_a_checkout_that_reads_them(self):
+        platform = self.fake_platform()
+        rows = json.loads((self.root / 'rows.json').read_text())
+        rows.append(dict(Id=99, app='aida-pbx', settingKey='MYSQL_HOST', settingValue='pbx-db'))
+        (self.root / 'rows.json').write_text(json.dumps(rows))
+        self.file('officepulse.env', 'NODE_ENV=production\nNOCODB_BASE_URL=https://nocodb.example.test\nNOCODB_API_TOKEN=pbx-secret\n')
+        body = platform + 'PHASE=officepulse; load_saved_inputs; phase_officepulse\n'
+        keys = lambda: {row['settingKey'] for row in json.loads((self.root / 'rows.json').read_text()) if row['app'] == 'aida-pbx'}
+        self.file('AidaPbx/src/config.ts', "str(env, 'MYSQL_HOST')\n")
+        self.shell(body)
+        self.assertIn('MYSQL_HOST', keys())
+        self.file('AidaPbx/src/config.ts', "['PBX_DB_HOST', 'MYSQL_HOST']\n")
+        self.shell(body)
+        self.assertIn('PBX_DB_HOST', keys())
+        self.assertNotIn('MYSQL_HOST', keys())
+
+    def test_retired_keys_are_reported_not_deleted(self):
+        body = self.renamed_scope_fixture([
+            ('aida', 'NOCODB_BASE_NAME', 'PlatformConfig'), ('aida-pbx', 'RUNTIME_MYSQL_PASSWORD', 'old-keep-secret'),
+            ('aida-pbx', 'DB_PASSWORD', 'current-secret')])
+        before = (self.root / 'rows.json').read_bytes()
+        r = self.shell(body + 'rename_settings_scopes\n')
+        self.assertIn('NOCODB_BASE_NAME (aida) is no longer read', r.stdout)
+        self.assertIn('RUNTIME_MYSQL_PASSWORD (aida-pbx) is no longer read', r.stdout)
+        self.assertNotIn('secret', r.stdout + r.stderr)
+        self.assertEqual(before, (self.root / 'rows.json').read_bytes())
+
     def test_renamed_scope_refuses_a_key_under_both_names(self):
         body = self.renamed_scope_fixture([('officepulse', 'ARI_URL', 'old'), ('aida-pbx', 'ARI_URL', 'new')])
         before = (self.root / 'rows.json').read_bytes()
