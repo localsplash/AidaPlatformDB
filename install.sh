@@ -606,6 +606,23 @@ rename_setting_keys() {
   if ! (( DRY )) && [ "$TABLE_ID" != dry ]; then rows_load; fi
 }
 
+# Run only with an AidaPbx checkout that no longer reads the enable switches, so
+# a row is never reported dead while a running older release still uses it.
+# Reports only; never deletes or writes.
+report_pbx_settings() {
+  local key found
+  for key in PBX_INVENTORY_ENABLED PBX_PROVISIONING_ENABLED; do
+    found=$(jq -r --arg k "$key" '[.[] | select(.settingKey==$k) | .app] | join(", ")' <<<"$ROWS_JSON")
+    [ -z "$found" ] || note "PlatformConfig $key ($found) is no longer read: AidaPbx always uses both PBX logins in production. Delete it in NocoDB."
+  done
+  if [ -n "$(row_get aida-pbx TRUSTED_PROXY_CIDRS)" ] && [ "$(row_get aida-pbx TRUSTED_PROXY_CIDRS)" = "$(row_get aida-pbx TRUSTED_SERVER_CIDRS)" ]; then
+    note "PlatformConfig aida-pbx/TRUSTED_PROXY_CIDRS equals TRUSTED_SERVER_CIDRS, which is now its default: delete it in NocoDB."
+  fi
+  for key in PBX_DB_HOST PBX_DB_NAME PBX_DB_INVENTORY_USER PBX_DB_INVENTORY_PASSWORD PBX_DB_PROVISIONING_USER PBX_DB_PROVISIONING_PASSWORD; do
+    [ -n "$(row_get aida-pbx "$key")" ] || note "PlatformConfig aida-pbx/$key is not set: AidaPbx will not start without it."
+  done
+}
+
 row_get() { # APP KEY -> value ('' when absent or blank)
   jq -r --arg a "$1" --arg k "$2" '[.[] | select(.app==$a and .settingKey==$k)] | .[0].settingValue // "" | tostring' <<<"$ROWS_JSON" | sed 's/^null$//'
 }
@@ -1354,6 +1371,7 @@ phase_officepulse() {
   clone_or_update AidaPbx "$DIR/AidaPbx"
   # Only with a checkout that reads the new names (a dry run has none to check).
   if [ ! -f "$DIR/AidaPbx/src/config.ts" ] || grep -q PBX_DB_HOST "$DIR/AidaPbx/src/config.ts"; then rename_setting_keys; fi
+  if [ -f "$DIR/AidaPbx/src/config.ts" ] && ! grep -q PBX_INVENTORY_ENABLED "$DIR/AidaPbx/src/config.ts"; then report_pbx_settings; fi
   local env_file=$OFFICEPULSE_ENV_FILE
   log "$env_file"
   run mkdir -p "$(dirname "$env_file")"
