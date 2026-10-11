@@ -492,6 +492,35 @@ rows_load
         self.assertNotIn('secret', r.stdout + r.stderr)
         self.assertEqual(before, (self.root / 'rows.json').read_bytes())
 
+    def test_pbx_settings_report_lists_dead_switches_redundant_proxy_and_missing_logins(self):
+        body = self.renamed_scope_fixture([
+            ('aida-pbx', 'PBX_INVENTORY_ENABLED', 'true'), ('aida', 'PBX_PROVISIONING_ENABLED', 'true'),
+            ('aida-pbx', 'TRUSTED_SERVER_CIDRS', '10.0.0.0/8'), ('aida-pbx', 'TRUSTED_PROXY_CIDRS', '10.0.0.0/8'),
+            ('aida-pbx', 'PBX_DB_HOST', 'pbx'), ('aida-pbx', 'PBX_DB_NAME', 'asterisk'),
+            ('aida-pbx', 'PBX_DB_INVENTORY_USER', 'ro'), ('aida-pbx', 'PBX_DB_INVENTORY_PASSWORD', 'ro-secret')])
+        before = (self.root / 'rows.json').read_bytes()
+        r = self.shell(body + 'report_pbx_settings\n')
+        self.assertIn('PBX_INVENTORY_ENABLED (aida-pbx) is no longer read', r.stdout)
+        self.assertIn('PBX_PROVISIONING_ENABLED (aida) is no longer read', r.stdout)
+        self.assertIn('TRUSTED_PROXY_CIDRS equals TRUSTED_SERVER_CIDRS', r.stdout)
+        self.assertIn('aida-pbx/PBX_DB_PROVISIONING_USER is not set', r.stdout)
+        self.assertIn('aida-pbx/PBX_DB_PROVISIONING_PASSWORD is not set', r.stdout)
+        self.assertNotIn('PBX_DB_INVENTORY_USER is not set', r.stdout)
+        self.assertNotIn('secret', r.stdout + r.stderr)
+        self.assertEqual(before, (self.root / 'rows.json').read_bytes())
+
+    def test_officepulse_phase_reports_switches_only_with_a_checkout_that_ignores_them(self):
+        platform = self.fake_platform()
+        rows = json.loads((self.root / 'rows.json').read_text())
+        rows.append(dict(Id=99, app='aida-pbx', settingKey='PBX_INVENTORY_ENABLED', settingValue='true'))
+        (self.root / 'rows.json').write_text(json.dumps(rows))
+        self.file('officepulse.env', 'NODE_ENV=production\nNOCODB_BASE_URL=https://nocodb.example.test\nNOCODB_API_TOKEN=pbx-secret\n')
+        body = platform + 'PHASE=officepulse; load_saved_inputs; phase_officepulse\n'
+        self.file('AidaPbx/src/config.ts', "PBX_DB_HOST env.PBX_INVENTORY_ENABLED\n")
+        self.assertNotIn('PBX_INVENTORY_ENABLED (aida-pbx) is no longer read', self.shell(body).stdout)
+        self.file('AidaPbx/src/config.ts', "PBX_DB_HOST\n")
+        self.assertIn('PBX_INVENTORY_ENABLED (aida-pbx) is no longer read', self.shell(body).stdout)
+
     def test_renamed_scope_refuses_a_key_under_both_names(self):
         body = self.renamed_scope_fixture([('officepulse', 'ARI_URL', 'old'), ('aida-pbx', 'ARI_URL', 'new')])
         before = (self.root / 'rows.json').read_bytes()
