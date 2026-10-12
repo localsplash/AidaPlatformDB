@@ -318,6 +318,7 @@ docker() { [[ $* == 'container inspect platform-mysql-local' ]]; }
 systemctl() { return 0; }
 provision_aida_databases() { die 'Unexpected account rotation'; }
 secret() { echo generated-fixture-secret; }
+pbx_sql() { return 1; }
 """
 
     def test_full_apps_phase_reuses_tokens_and_preserves_accounts_on_second_run(self):
@@ -520,6 +521,59 @@ rows_load
         self.assertNotIn('PBX_INVENTORY_ENABLED (aida-pbx) is no longer read', self.shell(body).stdout)
         self.file('AidaPbx/src/config.ts', "PBX_DB_HOST\n")
         self.assertIn('PBX_INVENTORY_ENABLED (aida-pbx) is no longer read', self.shell(body).stdout)
+
+    def pbx_login_fixture(self, settings, existing=''):
+        body = self.renamed_scope_fixture(settings)
+        self.file('AidaPbx/deploy/sql/pbx-inventory-grants.sql',
+                  "CREATE USER IF NOT EXISTS 'aida_pbx_inventory_ro'@'__OFFICEPULSE_API_IP__' IDENTIFIED BY '__STRONG_PASSWORD__';\n")
+        self.file('AidaPbx/deploy/sql/pbx-provisioning-grants.sql',
+                  "CREATE USER 'aida_pbx_provisioner'@'__OFFICEPULSE_API_IP__' IDENTIFIED BY '__STRONG_PASSWORD__';\n")
+        return body + r"""
+mysql() { :; }
+secret() { echo "pw-$RANDOM-secret"; }
+pbx_sql() {
+  case "$*" in
+    *information_schema.TABLES*) echo 7 ;;
+    *mysql.user*) [[ "$*" == *"User='""" + existing + r"""'"* ]] && echo 1 || echo 0 ;;
+    *) cat >> "$DIR/pbx.sql" ;;
+  esac
+}
+"""
+
+    def test_missing_pbx_logins_are_created_locally_with_their_rows(self):
+        body = self.pbx_login_fixture([('aida-pbx', 'DB_PASSWORD', 'x')])
+        r = self.shell(body + 'ensure_pbx_logins\n')
+        self.assertNotIn('pw-', r.stdout + r.stderr)
+        sql = (self.root / 'pbx.sql').read_text()
+        self.assertIn("'aida_pbx_inventory_ro'@'127.0.0.1'", sql)
+        self.assertIn("'aida_pbx_provisioner'@'127.0.0.1'", sql)
+        self.assertNotIn('__', sql)
+        rows = {(row['app'], row['settingKey']): row for row in json.loads((self.root / 'rows.json').read_text())}
+        self.assertEqual(rows[('aida-pbx', 'PBX_DB_HOST')]['settingValue'], '127.0.0.1')
+        self.assertEqual(rows[('aida-pbx', 'PBX_DB_NAME')]['settingValue'], 'asterisk')
+        self.assertEqual(rows[('aida-pbx', 'PBX_DB_INVENTORY_USER')]['settingValue'], 'aida_pbx_inventory_ro')
+        password = rows[('aida-pbx', 'PBX_DB_PROVISIONING_PASSWORD')]
+        self.assertTrue(password['bSecret'])
+        self.assertIn(password['settingValue'], sql, 'the row holds the password the login was created with')
+        before = (self.root / 'rows.json').read_bytes()
+        self.shell(body + 'ensure_pbx_logins\n')
+        self.assertEqual(sql, (self.root / 'pbx.sql').read_text(), 'a rerun creates nothing')
+        self.assertEqual(before, (self.root / 'rows.json').read_bytes())
+
+    def test_pbx_logins_are_left_alone_when_remote_or_already_present(self):
+        body = self.pbx_login_fixture([('aida-pbx', 'PBX_DB_HOST', '10.1.2.3')])
+        r = self.shell(body + 'ensure_pbx_logins\n')
+        self.assertIn('The PBX database is on 10.1.2.3', r.stdout)
+        self.assertFalse((self.root / 'pbx.sql').exists())
+        body = self.pbx_login_fixture([('aida-pbx', 'DB_PASSWORD', 'x')], existing='aida_pbx_provisioner')
+        r = self.shell(body + 'ensure_pbx_logins\n')
+        self.assertIn('PBX login aida_pbx_provisioner already exists', r.stdout)
+        sql = (self.root / 'pbx.sql').read_text()
+        self.assertIn('aida_pbx_inventory_ro', sql)
+        self.assertNotIn('aida_pbx_provisioner', sql)
+        keys = {row['settingKey'] for row in json.loads((self.root / 'rows.json').read_text())}
+        self.assertIn('PBX_DB_INVENTORY_PASSWORD', keys)
+        self.assertNotIn('PBX_DB_PROVISIONING_PASSWORD', keys)
 
     def test_renamed_scope_refuses_a_key_under_both_names(self):
         body = self.renamed_scope_fixture([('officepulse', 'ARI_URL', 'old'), ('aida-pbx', 'ARI_URL', 'new')])
