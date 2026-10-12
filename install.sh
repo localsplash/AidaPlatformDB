@@ -623,6 +623,61 @@ report_pbx_settings() {
   done
 }
 
+# The two logins AidaPbx uses on the PBX's own Asterisk database: KIND LOGIN
+# GRANTS (AidaPbx's deploy/sql template, the one source of the grants).
+PBX_LOGINS=("INVENTORY aida_pbx_inventory_ro pbx-inventory-grants.sql" "PROVISIONING aida_pbx_provisioner pbx-provisioning-grants.sql")
+PBX_TABLES="'ps_endpoints','ps_aors','ps_auths','ps_contacts','extensions','queues','queue_members'"
+pbx_sql() { command mysql --batch --skip-column-names "$@"; }
+
+# Creates a missing PBX login, with a generated password, and its rows, when
+# the Asterisk database is on this host and this user reaches it with the
+# local mysql client. A login that already exists is never changed, and a
+# remote database stays its operator's: both are reported instead.
+ensure_pbx_logins() {
+  local host db entry kind user file pw tables missing=0
+  for entry in "${PBX_LOGINS[@]}"; do
+    read -r kind user file <<<"$entry"
+    [ -n "$(row_get aida-pbx "PBX_DB_${kind}_USER")" ] && [ -n "$(row_get aida-pbx "PBX_DB_${kind}_PASSWORD")" ] || missing=1
+  done
+  (( missing )) || return 0
+  host=$(row_get aida-pbx PBX_DB_HOST); db=$(row_get aida-pbx PBX_DB_NAME)
+  case ${host:-127.0.0.1} in
+    127.0.0.1|localhost) ;;
+    *) note "The PBX database is on $host: create AidaPbx's PBX logins there (AidaPbx docs/DB_USERS.md) and fill in their aida-pbx rows."; return 0 ;;
+  esac
+  if [ "${db:-asterisk}" != asterisk ]; then
+    note "aida-pbx/PBX_DB_NAME is $db, but AidaPbx's grant templates name asterisk: create the PBX logins by hand (AidaPbx docs/DB_USERS.md)."; return 0
+  fi
+  if (( DRY )); then note "would create AidaPbx's missing PBX logins in the local asterisk database and fill in their rows"; return 0; fi
+  if ! have mysql || ! tables=$(pbx_sql -e "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='asterisk' AND TABLE_NAME IN ($PBX_TABLES)" 2>/dev/null); then
+    note "Cannot reach the local asterisk database with the mysql client as $(id -un): create AidaPbx's PBX logins by hand (AidaPbx docs/DB_USERS.md) and fill in their aida-pbx rows."
+    return 0
+  fi
+  if [ "$tables" != 7 ]; then
+    note "The local asterisk database lacks Asterisk realtime tables ($tables of 7 found): PBX logins not created."; return 0
+  fi
+  row_ensure aida-pbx PBX_DB_HOST 127.0.0.1 false "Host of the PBX's own Asterisk database."
+  row_ensure aida-pbx PBX_DB_NAME asterisk false "The PBX's Asterisk realtime database."
+  for entry in "${PBX_LOGINS[@]}"; do
+    read -r kind user file <<<"$entry"
+    [ -z "$(row_get aida-pbx "PBX_DB_${kind}_USER")" ] || [ -z "$(row_get aida-pbx "PBX_DB_${kind}_PASSWORD")" ] || continue
+    if [ -n "$(row_get aida-pbx "PBX_DB_${kind}_USER")" ] && [ "$(row_get aida-pbx "PBX_DB_${kind}_USER")" != "$user" ]; then
+      note "aida-pbx/PBX_DB_${kind}_USER names $(row_get aida-pbx "PBX_DB_${kind}_USER"): set its password row by hand."; continue
+    fi
+    if [ "$(pbx_sql -e "SELECT COUNT(*) FROM mysql.user WHERE User='$user' AND Host='127.0.0.1'")" != 0 ]; then
+      note "PBX login $user already exists, so its password is unknown here: fill in aida-pbx/PBX_DB_${kind}_USER and _PASSWORD by hand, or DROP USER '$user'@'127.0.0.1' and rerun."
+      continue
+    fi
+    [ -f "$DIR/AidaPbx/deploy/sql/$file" ] || die "AidaPbx checkout lacks deploy/sql/$file"
+    pw=$(secret)
+    sed -e "s/__OFFICEPULSE_API_IP__/127.0.0.1/g" -e "s/__STRONG_PASSWORD__/$pw/g" "$DIR/AidaPbx/deploy/sql/$file" | pbx_sql ||
+      die "could not create PBX login $user in the local asterisk database"
+    note "PBX login $user created in the local asterisk database"
+    row_set aida-pbx "PBX_DB_${kind}_PASSWORD" "$pw"
+    row_set aida-pbx "PBX_DB_${kind}_USER" "$user"
+  done
+}
+
 row_get() { # APP KEY -> value ('' when absent or blank)
   jq -r --arg a "$1" --arg k "$2" '[.[] | select(.app==$a and .settingKey==$k)] | .[0].settingValue // "" | tostring' <<<"$ROWS_JSON" | sed 's/^null$//'
 }
@@ -1361,8 +1416,9 @@ phase_officepulse() {
     die "Runtime database accounts are not configured: run 'install.sh database' or 'install.sh apps' first"
   fi
   seed_runtime_database_settings
-  # What this host can derive for OfficePulse; the PBX-specific rows (its
-  # Asterisk realtime database, ARI, the LiveKit SIP host) are its operator's.
+  # What this host can derive for OfficePulse; the other PBX-specific rows
+  # (ARI, the LiveKit SIP host) are its operator's. The Asterisk database
+  # logins are created below when that database is on this host.
   local env_name; env_name=$(row_get '*' ENVIRONMENT_NAME); env_name=${env_name:-${ENVIRONMENT_NAME:-dev}}
   row_ensure aida-pbx OFFICEPULSE_INSTANCE_ID "officepulse-$env_name" false "PBX instance wire name (pbxInstanceId) this OfficePulse serves."
   row_ensure aida-pbx OPS_PUBLIC_URL "https://officepulse-admin.$PARENT_DOMAIN" false "Public origin of the operations UI."
@@ -1371,7 +1427,10 @@ phase_officepulse() {
   clone_or_update AidaPbx "$DIR/AidaPbx"
   # Only with a checkout that reads the new names (a dry run has none to check).
   if [ ! -f "$DIR/AidaPbx/src/config.ts" ] || grep -q PBX_DB_HOST "$DIR/AidaPbx/src/config.ts"; then rename_setting_keys; fi
-  if [ -f "$DIR/AidaPbx/src/config.ts" ] && ! grep -q PBX_INVENTORY_ENABLED "$DIR/AidaPbx/src/config.ts"; then report_pbx_settings; fi
+  if [ -f "$DIR/AidaPbx/src/config.ts" ] && ! grep -q PBX_INVENTORY_ENABLED "$DIR/AidaPbx/src/config.ts"; then
+    ensure_pbx_logins
+    report_pbx_settings
+  fi
   local env_file=$OFFICEPULSE_ENV_FILE
   log "$env_file"
   run mkdir -p "$(dirname "$env_file")"
