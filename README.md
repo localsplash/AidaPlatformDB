@@ -144,6 +144,14 @@ old name is moved), writes its `/etc/aida-integration/env`
 (`NOCODB_BASE_URL`, `NOCODB_API_TOKEN`) and runs its own `scripts/install.sh`.
 Its settings are the `aida-pbx` rows (see that repository's README).
 
+When AidaPbx's two logins on the PBX's own `asterisk` database
+(`aida_pbx_inventory_ro`, read-only, and `aida_pbx_provisioner`, the writer) and
+their `aida-pbx/PBX_DB_*` rows are missing, it creates them: only when that
+database is on this host and reachable with the local `mysql` client, from
+AidaPbx's `deploy/sql` grant templates, with generated passwords stored as
+secret rows. It never changes a login that already exists, and a remote PBX
+database stays its operator's; both cases are reported for doing by hand.
+
 ## Day-to-day
 
 - The database layer is `docker compose up -d` in this folder on the database
