@@ -1526,7 +1526,13 @@ if [ -f "$SELF_DIR/compose.yaml" ] && [ -d "$SELF_DIR/echo" ]; then
   # to date and re-run, so an old install.sh cannot install the wrong thing;
   # one whose branch no longer exists at origin (promoted and deleted) moves
   # to origin's default branch first.
-  if ! (( DRY )) && [ "${INSTALL_UPDATED:-}" != 1 ] && [ -n "$current" ] && "${g[@]}" fetch -q --prune origin 2>/dev/null; then
+  fetched=0
+  if ! (( DRY )) && [ "${INSTALL_UPDATED:-}" != 1 ] && [ -n "$current" ]; then
+    if "${g[@]}" fetch -q --prune origin 2>/dev/null; then fetched=1
+    else note "Could not fetch origin in $SELF_DIR, so this run uses its checkout as is ($("${g[@]}" log -1 --format='%h %cs' 2>/dev/null)): fix git access there, or git pull by hand, for the current installer."
+    fi
+  fi
+  if (( fetched )); then
     if ! "${g[@]}" show-ref -q --verify "refs/remotes/origin/$current"; then
       default=$("${g[@]}" ls-remote --symref origin HEAD 2>/dev/null | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/", "", $2); print $2; exit}')
       [ -n "$default" ] || die "branch $current no longer exists at origin and its default branch could not be read; check out the right branch in $SELF_DIR and re-run"
@@ -1543,6 +1549,7 @@ if [ -f "$SELF_DIR/compose.yaml" ] && [ -d "$SELF_DIR/echo" ]; then
     fi
   fi
   [ -n "$BRANCH" ] || BRANCH=$current
+  note "Installer: $SELF_DIR on ${current:-a detached checkout} at $("${g[@]}" log -1 --format='%h %cs' 2>/dev/null)"
 fi
 BRANCH=${BRANCH:-main}
 
