@@ -1390,12 +1390,13 @@ phase_apps() {
   note "identity.$PARENT_DOMAIN       -> identity:3200"
   note "aida-admin.$PARENT_DOMAIN     -> aida-admin:3001"
   note "echo.$PARENT_DOMAIN           -> echo-web:3160"
-  note "echo-service.$PARENT_DOMAIN   -> echo-service:8080   (carrier webhooks only)"
+  note "echo-webhook.$PARENT_DOMAIN   -> echo-service:8080   (carrier webhooks only: /v1/ and /ping)"
   note "officepulse-api.$PARENT_DOMAIN -> the PBX host, port 8085"
   log "Still yours to fill in:"
   note "- https://identity.$PARENT_DOMAIN/setup claims Identity and takes the OAuth provider credentials."
   note "- aida/LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET: the LiveKit project (Identity's /admin edits any row)."
-  note "- Carrier credentials in Echo's sms_tbl_CarrierApplication, and the webhook URLs registered at each carrier."
+  note "- Carrier credentials in Echo's sms_tbl_CarrierApplication, and the webhook URLs registered at each carrier"
+  note "  (https://echo-webhook.$PARENT_DOMAIN/v1/...; Echo Settings > Carrier Applications lists them)."
 }
 
 # ── Phase c: the PBX host ────────────────────────────────────────────────────
