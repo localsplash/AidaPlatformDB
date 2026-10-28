@@ -112,6 +112,7 @@ apps then reach MySQL by container name).
    /opt/identity
    /opt/aida/AidaAdmin
    /opt/aida/AidaAgent
+   /opt/aida/LiveKitLogstore  detached at the tag in AidaAgent's LIVEKIT_LOGSTORE_REF
    /opt/echo                the Echo environment (from EchoWeb/deploy/environment)
      ├── EchoWeb  EchoService  EchoMedia
      └── compose.yaml  web.host.yaml  service.host.yaml  deploy.sh  .env
@@ -135,6 +136,14 @@ apps then reach MySQL by container name).
    and what is still yours to fill in: Identity's OAuth provider credentials
    (`/setup` in a browser claims the instance), the `aida/LIVEKIT_*` rows, and
    carrier credentials.
+
+LiveKitLogstore (AidaAgent's LiveKit SDK output, stored in the Firebase bucket) is
+private, so AidaAgent's image builds it from `aida/LiveKitLogstore`; the host's Git
+access must be able to read that repository. It stays off (`aida-agent/LOGSTORE_ENABLED=0`)
+until it has a writer key. `--logstore-key-file PATH` reads a service-account key JSON
+from the host, stores it in the secret row `aida-agent/LOGSTORE_KEY_JSON` and sets
+`LOGSTORE_ENABLED=1`; the agent picks both up when it restarts. Setting
+`LOGSTORE_ENABLED=0` and restarting AidaAgent turns it off again.
 
 ### c) The PBX host — `./install.sh officepulse`
 
