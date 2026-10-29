@@ -346,6 +346,72 @@ phase_apps
             self.assertNotIn('aida-admin-db-secret', result.stdout + result.stderr)
         self.assertIn('aida-admin/DB_NAME=aida_admin_db', second.stdout)
 
+    def apps_fixture(self):
+        platform = self.fake_platform()
+        for app in ('identity', 'aida/AidaAdmin', 'aida/AidaAgent'):
+            self.file(app + '/.env', 'NOCODB_BASE_URL=https://nocodb.example.test\nNOCODB_API_TOKEN=keep-app-secret\n')
+        self.file('identity/compose.yaml', '')
+        self.file('identity/scripts/db-users.sh', '')
+        for name in ('compose.yaml', 'web.host.yaml', 'service.host.yaml', 'deploy.sh'):
+            self.file('echo/EchoWeb/deploy/environment/' + name, '')
+        self.file('echo/.env', 'NOCODB_BASE_URL=https://nocodb.example.test\nECHO_WEB_NOCODB_API_TOKEN=keep-web-secret\nECHO_SERVICE_NOCODB_API_TOKEN=keep-service-secret\n')
+        self.file('aida/AidaAgent/LIVEKIT_LOGSTORE_REF', 'v0.1.0\n')
+        return platform + '''
+load_saved_inputs
+SAVED_VALUES[ENVIRONMENT_NAME]=staging
+checkout_tag() { echo "checkout_tag $*" >>"$DIR/checkouts"; }
+'''
+
+    def rows(self):
+        return {(r['app'], r['settingKey']): r for r in json.loads((self.root / 'rows.json').read_text())}
+
+    def test_apps_phase_pins_livekit_logstore_and_leaves_it_off_without_a_key(self):
+        result = self.shell(self.apps_fixture() + 'phase_apps\n')
+        self.assertEqual((self.root / 'checkouts').read_text(),
+                         f'checkout_tag LiveKitLogstore {self.root}/aida/LiveKitLogstore v0.1.0\n')
+        rows = self.rows()
+        self.assertEqual(rows[('aida-agent', 'LOGSTORE_ENABLED')]['settingValue'], '0')
+        self.assertEqual(rows[('aida-agent', 'LOGSTORE_KEY_JSON')]['settingValue'], '')
+        self.assertTrue(rows[('aida-agent', 'LOGSTORE_KEY_JSON')]['bSecret'])
+        self.assertIn('--logstore-key-file', result.stdout)
+
+    def test_logstore_key_file_is_stored_hidden_and_turns_logging_on(self):
+        key = {'type': 'service_account', 'client_email': 'w@example.iam.gserviceaccount.com',
+               'private_key': '-----BEGIN PRIVATE KEY-----\nkey-material\n-----END PRIVATE KEY-----\n',
+               'token_uri': 'https://oauth2.googleapis.com/token'}
+        path = self.file('secrets/gcs_service_account.json', json.dumps(key, indent=2))
+        result = self.shell(self.apps_fixture() + f'LOGSTORE_KEY_PATH={path}\nphase_apps\n')
+        rows = self.rows()
+        stored = rows[('aida-agent', 'LOGSTORE_KEY_JSON')]['settingValue']
+        self.assertEqual(json.loads(stored), key)
+        self.assertNotIn('\n  ', stored)
+        self.assertEqual(rows[('aida-agent', 'LOGSTORE_ENABLED')]['settingValue'], '1')
+        self.assertNotIn('key-material', result.stdout + result.stderr)
+        self.assertNotIn('--logstore-key-file', result.stdout)
+
+    def test_logstore_key_file_that_is_not_a_service_account_key_stops_the_install(self):
+        path = self.file('secrets/user.json', json.dumps({'type': 'authorized_user', 'refresh_token': 'x'}))
+        result = self.shell(self.apps_fixture() + f'LOGSTORE_KEY_PATH={path}\nphase_apps\n', ok=False)
+        self.assertIn('is not a service-account key', result.stderr)
+        self.assertEqual(self.rows()[('aida-agent', 'LOGSTORE_KEY_JSON')]['settingValue'], '')
+
+    def test_checkout_tag_clones_then_moves_between_tags(self):
+        remote = self.root / 'remotes/LiveKitLogstore.git'
+        git = ['git', '-c', 'user.name=t', '-c', 'user.email=t@t', '-C', str(remote)]
+        remote.mkdir(parents=True)
+        subprocess.run(['git', 'init', '-q', str(remote)], check=True)
+        for tag in ('v0.1.0', 'v0.2.0'):
+            (remote / 'VERSION').write_text(tag)
+            subprocess.run(git + ['add', '.'], check=True)
+            subprocess.run(git + ['commit', '-qm', tag], check=True)
+            subprocess.run(git + ['tag', tag], check=True)
+        body = 'GIT_BASE=$DIR/remotes\n'
+        self.shell(body + 'checkout_tag LiveKitLogstore "$DIR/aida/LiveKitLogstore" v0.1.0\n')
+        self.assertEqual((self.root / 'aida/LiveKitLogstore/VERSION').read_text(), 'v0.1.0')
+        self.shell(body + 'checkout_tag LiveKitLogstore "$DIR/aida/LiveKitLogstore" v0.2.0\n')
+        self.assertEqual((self.root / 'aida/LiveKitLogstore/VERSION').read_text(), 'v0.2.0')
+        self.shell(body + 'checkout_tag LiveKitLogstore "$DIR/aida/LiveKitLogstore" v9.9.9\n', ok=False)
+
     def test_full_officepulse_phase_reuses_system_service_token(self):
         platform = self.fake_platform()
         path = self.file('officepulse.env', 'NODE_ENV=production\nNOCODB_BASE_URL=https://nocodb.example.test\nNOCODB_API_TOKEN=pbx-secret\n')

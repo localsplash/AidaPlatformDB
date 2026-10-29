@@ -51,6 +51,7 @@ TOKEN_AIDA_AGENT=${TOKEN_AIDA_AGENT:-}
 TOKEN_ECHO_WEB=${TOKEN_ECHO_WEB:-}
 TOKEN_ECHO_SERVICE=${TOKEN_ECHO_SERVICE:-}
 TOKEN_OFFICEPULSE=${TOKEN_OFFICEPULSE:-}
+LOGSTORE_KEY_PATH=""
 
 # Persisted values are defaults, not explicit overrides. Never source an .env.
 declare -A SAVED_VALUES=() GIVEN_INPUTS=()
@@ -89,6 +90,8 @@ Options
   --data-dir PATH          database: host directory for MySQL's and NocoDB's data (default /var/lib/aidaplatformdb)
   --token-identity, --token-aida-admin, --token-aida-agent, --token-echo-web,
   --token-echo-service, --token-officepulse   per-application NocoDB API tokens
+  --logstore-key-file PATH apps: service-account key JSON for LiveKitLogstore; stores it in
+                           aida-agent/LOGSTORE_KEY_JSON (secret) and sets LOGSTORE_ENABLED=1
   --yes                    never prompt; use saved values/defaults unless explicitly overridden
   --no-deploy              clone, write .env files, create accounts and rows, but do not build or start
   --dry-run                preview changes with secrets hidden; skip checkout auto-update
@@ -123,7 +126,7 @@ secret() { openssl rand -hex 32; }
 # curl | bash. EOF is an abort, not permission to replace a saved secret.
 is_secret_key() {
   local key=${1^^}; key=${key//-/_}
-  [[ $key =~ (PASSWORD|PASS|SECRET|TOKEN|API_KEY|PRIVATE_KEY|PWD|DATABASE_URL) ]]
+  [[ $key =~ (PASSWORD|PASS|SECRET|TOKEN|API_KEY|PRIVATE_KEY|KEY_JSON|PWD|DATABASE_URL) ]]
 }
 shown_value() {
   if [[ ${3:-false} = true || ${3:-false} = 1 ]] || is_secret_key "$1" || [[ $2 == *://*:*@* ]]; then
@@ -443,6 +446,22 @@ clone_or_update() { # REPO DEST
     run mkdir -p "$(dirname "$dest")"
     run git clone -q -b "$branch" "$GIT_BASE/$repo.git" "$dest"
   fi
+}
+
+# checkout_tag REPO DEST TAG: a pinned library an application builds from, detached
+# at the tag the application names (AidaAgent's LIVEKIT_LOGSTORE_REF).
+checkout_tag() {
+  local repo=$1 dest=$2 tag=$3
+  if [ -d "$dest/.git" ]; then
+    note "$dest: checking out $tag"
+    run git -C "$dest" fetch --prune --tags -q origin
+  else
+    note "$dest: cloning $repo@$tag"
+    run mkdir -p "$(dirname "$dest")"
+    run git clone -q "$GIT_BASE/$repo.git" "$dest" \
+      || die "cannot clone $GIT_BASE/$repo.git: this host's Git access needs read access to it"
+  fi
+  run git -C "$dest" checkout -q --detach "refs/tags/$tag"
 }
 
 # export_stamp DIR: the build args every compose file reads.
@@ -1266,6 +1285,15 @@ phase_apps() {
   done
   clone_or_update AidaAdmin "$DIR/aida/AidaAdmin"
   clone_or_update AidaAgent "$DIR/aida/AidaAgent"
+  # LiveKitLogstore is private: AidaAgent's image takes it as a build context
+  # from beside it, at the tag AidaAgent pins.
+  local logstore_ref=""
+  [ ! -f "$DIR/aida/AidaAgent/LIVEKIT_LOGSTORE_REF" ] || logstore_ref=$(tr -d '[:space:]' <"$DIR/aida/AidaAgent/LIVEKIT_LOGSTORE_REF")
+  if [ -n "$logstore_ref" ]; then
+    checkout_tag LiveKitLogstore "$DIR/aida/LiveKitLogstore" "$logstore_ref"
+  else
+    note "AidaAgent pins no LiveKitLogstore version; not checking it out"
+  fi
   clone_or_update EchoWeb "$DIR/echo/EchoWeb"
   clone_or_update EchoService "$DIR/echo/EchoService"
   clone_or_update EchoMedia "$DIR/echo/EchoMedia"
@@ -1359,6 +1387,16 @@ phase_apps() {
   row_ensure aida-agent AIDA_LLM_MODEL google/gemma-4-31b-it false "LiveKit Inference LLM."
   row_ensure aida-agent AIDA_TTS_MODEL deepgram/aura-2 false "LiveKit Inference text-to-speech model."
   row_ensure aida-agent AIDA_TTS_VOICE asteria false "Voice for AIDA_TTS_MODEL."
+  row_ensure aida-agent LOGSTORE_ENABLED 0 false "1 sends AidaAgent's LiveKit SDK output (including call content) to the Firebase bucket through LiveKitLogstore; needs LOGSTORE_KEY_JSON. Read at start."
+  row_ensure aida-agent LOGSTORE_KEY_JSON "" true "Service-account key JSON allowed to create objects under livekit-logstore/ in the Firebase bucket. Set with install.sh apps --logstore-key-file."
+  if [ -n "$LOGSTORE_KEY_PATH" ]; then
+    [ -r "$LOGSTORE_KEY_PATH" ] || die "cannot read $LOGSTORE_KEY_PATH"
+    local logstore_key
+    logstore_key=$(jq -ce 'select(.type == "service_account" and (.client_email | type) == "string" and (.private_key | type) == "string")' "$LOGSTORE_KEY_PATH" 2>/dev/null) \
+      || die "$LOGSTORE_KEY_PATH is not a service-account key"
+    row_set aida-agent LOGSTORE_KEY_JSON "$logstore_key"
+    row_set aida-agent LOGSTORE_ENABLED 1
+  fi
 
   if ! (( accounts_done )); then
     log "MySQL accounts on $DB_HOST (fallback: created from here with root)"
@@ -1395,6 +1433,9 @@ phase_apps() {
   log "Still yours to fill in:"
   note "- https://identity.$PARENT_DOMAIN/setup claims Identity and takes the OAuth provider credentials."
   note "- aida/LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET: the LiveKit project (Identity's /admin edits any row)."
+  if [ -z "$(row_get aida-agent LOGSTORE_KEY_JSON)" ]; then
+    note "- Optional: aida-agent/LOGSTORE_KEY_JSON for LiveKitLogstore (re-run with --logstore-key-file PATH)."
+  fi
   note "- Carrier credentials in Echo's sms_tbl_CarrierApplication, and the webhook URLs registered at each carrier"
   note "  (https://echo-webhook.$PARENT_DOMAIN/v1/...; Echo Settings > Carrier Applications lists them)."
 }
@@ -1504,6 +1545,7 @@ while [ $# -gt 0 ]; do
     --token-echo-web) TOKEN_ECHO_WEB=$2; shift ;;
     --token-echo-service) TOKEN_ECHO_SERVICE=$2; shift ;;
     --token-officepulse) TOKEN_OFFICEPULSE=$2; shift ;;
+    --logstore-key-file) LOGSTORE_KEY_PATH=$(readlink -f "$2"); shift ;;
     --yes) YES=1 ;;
     --no-deploy) NO_DEPLOY=1 ;;
     --rollback) ROLLBACK=1 ;;
